@@ -1,0 +1,19 @@
+{
+  "name": "pilotpro-serveur",
+  "version": "1.0.0",
+  "description": "PilotPro — Serveur GPAO/ERP pour DBS Fashion (base partagée multi-utilisateurs)",
+  "main": "server.js",
+  "bin": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "build:exe": "pkg . --targets node18-win-x64 --output PilotPro-Serveur.exe"
+  },
+  "pkg": {
+    "assets": [],
+    "scripts": []
+  },
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=18"
+  }
+}

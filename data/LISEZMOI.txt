@@ -1,0 +1,1 @@
+Ce dossier contiendra data/state.json (vos donnees partagees).
