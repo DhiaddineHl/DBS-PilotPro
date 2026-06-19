@@ -58,12 +58,26 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // ── API : révision courante (léger, pour le polling) ──
+  if (url === '/api/rev' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ rev: loadState().rev || 0 }));
+    return;
+  }
+
   // ── API : enregistrer l'état partagé ──
   if (url === '/api/state' && req.method === 'POST') {
     readBody(req, body => {
       try {
         const incoming = JSON.parse(body || '{}');
         const cur = loadState();
+        // Garde anti-écrasement : si le client part d'une révision périmée, on refuse
+        // et on lui renvoie l'état à jour (évite d'écraser le travail d'un collègue).
+        if (typeof incoming.baseRev === 'number' && incoming.baseRev !== (cur.rev || 0)) {
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, conflict: true, keys: cur.keys || {}, rev: cur.rev || 0 }));
+          return;
+        }
         const next = {
           keys: incoming.keys || {},
           rev: (cur.rev || 0) + 1,
