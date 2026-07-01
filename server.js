@@ -19,7 +19,7 @@ if (!fs.existsSync(DATADIR)) fs.mkdirSync(DATADIR, { recursive: true });
 
 function loadState() {
   try { return JSON.parse(fs.readFileSync(STATE, 'utf8')); }
-  catch (e) { return { keys: {}, rev: 0, updatedAt: null }; }
+  catch (e) { return { keys: {}, keyRev: {}, rev: 0, updatedAt: null }; }
 }
 function saveState(s) {
   // Écriture atomique : fichier temporaire puis renommage
@@ -60,8 +60,9 @@ const server = http.createServer((req, res) => {
 
   // ── API : révision courante (léger, pour le polling) ──
   if (url === '/api/rev' && req.method === 'GET') {
+    const s = loadState();
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ rev: loadState().rev || 0 }));
+    res.end(JSON.stringify({ rev: s.rev || 0, keyRev: s.keyRev || {} }));
     return;
   }
 
@@ -71,21 +72,44 @@ const server = http.createServer((req, res) => {
       try {
         const incoming = JSON.parse(body || '{}');
         const cur = loadState();
-        // Garde anti-écrasement : si le client part d'une révision périmée, on refuse
-        // et on lui renvoie l'état à jour (évite d'écraser le travail d'un collègue).
+        cur.keys = cur.keys || {};
+        cur.keyRev = cur.keyRev || {};
+
+        // ── Fusion PAR CLÉ : chaque module (facture, grand livre, GPAO…) a sa propre
+        //    révision. Deux personnes sur deux modules différents ne s'écrasent jamais.
+        if (incoming.keys && incoming.baseKeyRev) {
+          const conflicts = {};
+          let accepted = 0;
+          Object.keys(incoming.keys).forEach(k => {
+            const serverKR = cur.keyRev[k] || 0;
+            const baseKR   = incoming.baseKeyRev[k] || 0;
+            if (baseKR === serverKR) {            // le client part de la version courante → on accepte
+              cur.keys[k] = incoming.keys[k];
+              cur.keyRev[k] = serverKR + 1;
+              accepted++;
+            } else {                               // version périmée pour CETTE clé → conflit (on renvoie la version serveur)
+              conflicts[k] = cur.keys[k];
+            }
+          });
+          if (accepted) { cur.rev = (cur.rev || 0) + 1; cur.updatedAt = new Date().toISOString(); saveState(cur); }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, rev: cur.rev || 0, keyRev: cur.keyRev, conflicts: conflicts }));
+          return;
+        }
+
+        // ── Repli (ancien client, état global) ──
         if (typeof incoming.baseRev === 'number' && incoming.baseRev !== (cur.rev || 0)) {
           res.writeHead(409, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, conflict: true, keys: cur.keys || {}, rev: cur.rev || 0 }));
           return;
         }
-        const next = {
-          keys: incoming.keys || {},
-          rev: (cur.rev || 0) + 1,
-          updatedAt: new Date().toISOString()
-        };
+        const nk = incoming.keys || {};
+        const nkr = cur.keyRev || {};
+        Object.keys(nk).forEach(k => { nkr[k] = (nkr[k] || 0) + 1; });
+        const next = { keys: nk, keyRev: nkr, rev: (cur.rev || 0) + 1, updatedAt: new Date().toISOString() };
         saveState(next);
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, rev: next.rev }));
+        res.end(JSON.stringify({ ok: true, rev: next.rev, keyRev: next.keyRev }));
       } catch (e) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: false, error: String(e) }));
