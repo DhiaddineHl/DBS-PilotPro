@@ -12,8 +12,5 @@
     "assets": [],
     "scripts": []
   },
-  "license": "UNLICENSED",
-  "engines": {
-    "node": ">=18"
-  }
+  "license": "UNLICENSED"
 }
