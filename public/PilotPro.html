@@ -2819,8 +2819,14 @@ function startApp(){
 (function tryAutoLogin(){
   try{
     var _q=new URLSearchParams(location.search); var _rp=_q.get('rend')||_q.get('badge')||_q.get('matricule')||_q.get('mat')||_q.get('m')||_q.get('id')||((location.hash.match(/(?:rend|badge|matricule|mat|m|id)=([^&]+)/)||[])[1]);
-    if(_q.get('sup')||_q.get('board')||_q.get('dir')||/(?:sup|board|dir)=/.test(location.hash)){ setTimeout(renderSupervisionPortal,30); return; }
-    if(_rp){ setTimeout(function(){ renderOuvrierePortal(decodeURIComponent(_rp)); }, 30); return; }
+    var _isSup=!!(_q.get('sup')||_q.get('board')||_q.get('dir')||/(?:sup|board|dir)=/.test(location.hash));
+    if(_isSup||_rp){
+      try{ var _st=document.createElement('style'); _st.textContent='#login{display:none!important}#app{display:none!important}'; (document.head||document.documentElement).appendChild(_st); }catch(e){}
+      var _pTries=0;
+      var _pb=function(){ try{ if(_isSup) renderSupervisionPortal(); else renderOuvrierePortal(decodeURIComponent(_rp)); }catch(e){ console.error('portal',e); if(++_pTries<40) setTimeout(_pb,300); } };
+      if(document.readyState==='loading'){ document.addEventListener('DOMContentLoaded',function(){ setTimeout(_pb,30); }); } else { setTimeout(_pb,30); }
+      return;
+    }
   }catch(e){}
   try{
     const s = JSON.parse(sessionStorage.getItem('pp_user'));
@@ -7206,7 +7212,7 @@ function objJour(j){ var oh=(j.objManuel>0)?j.objManuel:(function(){ var m=findM
 function cellDetail(j,oid,col){ var dt=j.opsDetail&&j.opsDetail[oid]&&j.opsDetail[oid][col]; return (dt&&dt.length)?dt:null; }
 function cellDisp(j,oid,col){ var dt=cellDetail(j,oid,col); if(dt){ var t=0; for(var k=0;k<dt.length;k++) t+=(+dt[k].qte||0); return String(t); } var v=(j.ops&&j.ops[oid]||{})[col]; if(v==='RI'||v==='ABS') return v; return (typeof v==='number')?String(v):''; }
 function ouvTotal(j,oid){ var t=0; (j.cols||[]).forEach(function(col){ var d=cellDisp(j,oid,col); var n=parseFloat(d); if(!isNaN(n)) t+=n; }); return Math.round(t); }
-function base(inner){ document.body.innerHTML='<div style="max-width:560px;margin:0 auto;padding:14px 14px 30px;font-family:system-ui,Segoe UI,Roboto,sans-serif;background:#f2f5fa;min-height:100vh;box-sizing:border-box">'+inner+'</div>'; window.scrollTo(0,0); }
+function base(inner){ try{ document.documentElement.style.height='auto'; document.documentElement.style.overflow='auto'; document.body.style.height='auto'; document.body.style.overflow='auto'; document.body.style.margin='0'; document.body.style.background='#f2f5fa'; }catch(e){} document.body.innerHTML='<div style="max-width:560px;margin:0 auto;padding:14px 14px 30px;font-family:system-ui,Segoe UI,Roboto,sans-serif;background:#f2f5fa;min-height:100vh;box-sizing:border-box">'+inner+'</div>'; window.scrollTo(0,0); }
 function header(sub){
   return '<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">'+
    '<div style="width:42px;height:42px;border-radius:11px;background:#1d4ed8;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:13px">DBS</div>'+
@@ -7355,26 +7361,128 @@ if(document.readyState!=='loading'){ askName(); load().then(listScreen); }
 })();
 </script>
 <script>
-/* ═══════ COUCHE SYNCHRONISATION SERVEUR v3 (PilotPro) ═══════
-   • Push intelligent : fusion clé par clé (n'écrase plus le travail des autres postes)
-   • Pull automatique toutes les 5 s : les saisies faites ailleurs (portail atelier,
-     autres postes) arrivent seules — GPAO et la TV se rafraîchissent en direct. */
+/* ═══════ MODE SECOURS (?secours) — sauvetage & restauration des données ═══════ */
 (function(){
-  if(location.search.indexOf('atelier')>=0) return; /* portail atelier : synchro dédiée */
+if(!/(\?|&)secours/.test(location.search)) return;
+var KEYS=['pilotpro_v2','dbs_overrides_2026','dbs_couts_articles_2026','dbs_deleted_2026','dbs_paiements_2026','dbs_comptes_bancaires','dbs_activity_log','dbs_cmd_photos','dbs_gpao_prod_v2','dbs_grandlivre_2026_v2','dbs_taux_eur'];
+function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
+function snap(){ var o={}; KEYS.forEach(function(k){ var v=localStorage.getItem(k); if(v!=null) o[k]=v; }); return o; }
+function fmtDT(ts){ try{ return new Date(ts).toLocaleString('fr-FR'); }catch(e){ return String(ts); } }
+function kb(n){ return (n/1024).toFixed(1)+' Ko'; }
+function analyse(keys){
+  var out={actTs:0,gpaoMax:'',gpaoJ:0,orders:0,size:0};
+  try{ var a=JSON.parse(keys['dbs_activity_log']||'[]'); if(a.length) out.actTs=a[a.length-1].ts||0; }catch(e){}
+  try{ var g=JSON.parse(keys['dbs_gpao_prod_v2']||'null'); if(g&&g.journees){ out.gpaoJ=g.journees.length; g.journees.forEach(function(j){ if((j.date||'')>out.gpaoMax) out.gpaoMax=j.date; }); } }catch(e){}
+  try{ var p=JSON.parse(keys['pilotpro_v2']||'null'); if(p&&p.orders) out.orders=p.orders.length; }catch(e){}
+  for(var k in keys) out.size+=(keys[k]||'').length;
+  return out;
+}
+function dl(obj,name){ var a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([JSON.stringify(obj)],{type:'application/json'})); a.download=name; document.body.appendChild(a); a.click(); a.remove(); }
+function note(msg,ok){ var n=document.getElementById('sec-note'); if(n){ n.textContent=msg; n.style.color=ok?'#22c55e':'#f59e0b'; } }
+function card(title,inner){ return '<div style="background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.14);border-radius:14px;padding:16px;margin-bottom:14px"><div style="font-weight:800;font-size:15px;margin-bottom:10px">'+title+'</div>'+inner+'</div>'; }
+function btn(label,fn,color){ return '<button onclick="'+fn+'" style="background:'+(color||'#1d4ed8')+';border:none;color:#fff;border-radius:9px;padding:10px 14px;font-size:13px;font-weight:700;cursor:pointer;margin:4px 6px 0 0">'+label+'</button>'; }
+function render(){
+  var keys=snap(); var a=analyse(keys);
+  var infoRows='<div style="font-size:13px;line-height:1.9">'+
+    'Derni\u00e8re activit\u00e9 enregistr\u00e9e sur CE poste : <b>'+(a.actTs?fmtDT(a.actTs):'\u2014')+'</b><br>'+
+    'GPAO : <b>'+a.gpaoJ+'</b> journ\u00e9e(s), la plus r\u00e9cente : <b>'+(a.gpaoMax||'\u2014')+'</b><br>'+
+    'Commandes : <b>'+a.orders+'</b> \u00b7 Taille totale : <b>'+kb(a.size)+'</b></div>';
+  var pre=''; 
+  try{ var pb=localStorage.getItem('pp_preseed_backup');
+    if(pb){ var pj=JSON.parse(pb); var pa=analyse(pj.keys||{});
+      pre=card('\ud83d\udd52 Copie de s\u00e9curit\u00e9 automatique (donn\u00e9es de ce poste AVANT la derni\u00e8re synchro)',
+        '<div style="font-size:13px;line-height:1.9">Prise le : <b>'+esc(pj._date||'?')+'</b><br>GPAO : '+pa.gpaoJ+' journ\u00e9e(s), max <b>'+(pa.gpaoMax||'\u2014')+'</b> \u00b7 derni\u00e8re activit\u00e9 : <b>'+(pa.actTs?fmtDT(pa.actTs):'\u2014')+'</b></div>'+
+        btn('\ud83d\udce5 T\u00e9l\u00e9charger cette copie','__sec.dlPre()')+btn('\ud83d\udce4 Restaurer cette copie sur le serveur','__sec.pushPre()','#b45309')); }
+  }catch(e){}
+  document.body.innerHTML='<div style="max-width:680px;margin:0 auto;padding:20px 16px 60px;font-family:system-ui;color:#fff">'+
+   '<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px"><div style="width:44px;height:44px;border-radius:11px;background:#b45309;display:flex;align-items:center;justify-content:center;font-size:22px">\ud83d\udee0</div><div><div style="font-weight:800;font-size:19px">Mode secours \u2014 PilotPro</div><div style="font-size:12px;opacity:.7">Sauvetage et restauration des donn\u00e9es \u00b7 DBS Fashion</div></div></div>'+
+   '<div id="sec-note" style="min-height:20px;font-size:13px;font-weight:700;margin-bottom:10px"></div>'+
+   card('\ud83d\udcbb Donn\u00e9es pr\u00e9sentes sur CE poste / t\u00e9l\u00e9phone', infoRows+
+     btn('\ud83d\udce5 T\u00e9l\u00e9charger la sauvegarde de ce poste','__sec.dlNow()','#16a34a')+
+     btn('\ud83d\udce4 Utiliser CES donn\u00e9es comme r\u00e9f\u00e9rence (envoyer au serveur)','__sec.pushNow()','#b45309'))+
+   pre+
+   card('\ud83d\uddc4 Sauvegardes horaires du serveur', '<div id="sec-bk" style="font-size:13px;opacity:.8">Chargement\u2026</div>')+
+   '<div style="font-size:11.5px;opacity:.6;line-height:1.7">Cette page ne modifie RIEN tant que vous ne cliquez pas sur un bouton d\u0027envoi/restauration. Apr\u00e8s une restauration serveur, faites Ctrl+Shift+R sur tous les postes.</div>'+
+  '</div>';
+  document.body.style.cssText='margin:0;background:linear-gradient(160deg,#0b1220,#111827);min-height:100vh;height:auto;overflow:auto'; try{ document.documentElement.style.height='auto'; document.documentElement.style.overflow='auto'; }catch(e){}
+  document.title='PilotPro \u2014 Mode secours';
+  loadBk();
+}
+function loadBk(){
+  fetch('/api/backups',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
+    var el=document.getElementById('sec-bk'); if(!el) return;
+    var bks=(d&&d.backups)||[];
+    if(!bks.length){ el.innerHTML='Aucune sauvegarde horaire pour le moment (elles se cr\u00e9ent automatiquement \u00e0 chaque heure d\u0027activit\u00e9 \u00e0 partir de cette version).'; return; }
+    el.innerHTML=bks.slice(0,48).map(function(b){ return '<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.08)"><span style="flex:1">'+esc(b.name.replace('state-','').replace('.json',''))+'</span><span style="opacity:.6;font-size:11px">'+kb(b.size)+'</span><a href="/api/backups/'+encodeURIComponent(b.name)+'" style="color:#93c5fd;font-size:12px;text-decoration:none">t\u00e9l\u00e9charger</a><button onclick="__sec.restore(\''+b.name+'\')" style="background:#b45309;border:none;color:#fff;border-radius:7px;padding:5px 10px;font-size:11px;font-weight:700;cursor:pointer">Restaurer</button></div>'; }).join('');
+  }).catch(function(){ var el=document.getElementById('sec-bk'); if(el) el.textContent='Serveur injoignable.'; });
+}
+window.__sec={
+  dlNow:function(){ dl({_app:'PilotPro',_version:2,_type:'sauvegarde_complete',_date:new Date().toISOString(),keys:snap()},'PilotPro_secours_'+new Date().toISOString().slice(0,16).replace(/[:T]/g,'-')+'.json'); note('Sauvegarde t\u00e9l\u00e9charg\u00e9e \u2014 gardez ce fichier pr\u00e9cieusement.',true); },
+  pushNow:function(){ if(!confirm('Envoyer les donn\u00e9es de CE poste au serveur ?\\nElles remplaceront les donn\u00e9es serveur actuelles (une sauvegarde horaire du serveur est faite avant).')) return;
+    fetch('/api/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys:snap(),ts:Date.now()})}).then(function(r){return r.json();}).then(function(d){ note(d.ok?'\u2713 Donn\u00e9es envoy\u00e9es au serveur. Faites Ctrl+Shift+R sur les autres postes.':'\u00c9chec : '+(d.error||''),d.ok); }).catch(function(){ note('Serveur injoignable.',false); }); },
+  dlPre:function(){ try{ var pj=JSON.parse(localStorage.getItem('pp_preseed_backup')); dl({_app:'PilotPro',_version:2,_type:'sauvegarde_complete',_date:pj._date,keys:pj.keys},'PilotPro_copie_avant_synchro.json'); note('Copie t\u00e9l\u00e9charg\u00e9e.',true); }catch(e){ note('Copie illisible.',false); } },
+  pushPre:function(){ try{ var pj=JSON.parse(localStorage.getItem('pp_preseed_backup')); if(!confirm('Restaurer sur le serveur les donn\u00e9es de ce poste datant d\u0027AVANT la derni\u00e8re synchro ('+(pj._date||'?')+') ?')) return;
+    fetch('/api/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys:pj.keys||{},ts:Date.now()})}).then(function(r){return r.json();}).then(function(d){ note(d.ok?'\u2713 Copie restaur\u00e9e sur le serveur. Ctrl+Shift+R partout.':'\u00c9chec.',d.ok); }).catch(function(){ note('Serveur injoignable.',false); }); }catch(e){ note('Copie illisible.',false); } },
+  restore:function(name){ if(!confirm('Restaurer la sauvegarde serveur \u00ab '+name+' \u00bb comme donn\u00e9es courantes ?')) return;
+    fetch('/api/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name})}).then(function(r){return r.json();}).then(function(d){ note(d.ok?'\u2713 Sauvegarde restaur\u00e9e. Faites Ctrl+Shift+R sur tous les postes.':'\u00c9chec : '+(d.error||''),d.ok); }).catch(function(){ note('Serveur injoignable.',false); }); }
+};
+if(document.readyState!=='loading') render(); else document.addEventListener('DOMContentLoaded',render);
+})();
+
+</script>
+<script>
+/* ═══════ COUCHE SYNCHRONISATION SERVEUR v4 (PilotPro) ═══════
+   • Fusion clé par clé + pull auto 5 s (v3)
+   • HORODATAGE : au démarrage, le poste le plus RÉCENT gagne —
+     un vieux poste ne peut plus écraser silencieusement les données fraîches.
+   • Serveur vide (nouveau déploiement) : ce poste renvoie ses données,
+     rien n'est effacé localement.
+   • Copie de sécurité locale avant tout remplacement (pp_preseed_backup). */
+(function(){
+  if(/(\?|&)(atelier|secours|rend|sup)=?/.test(location.search)) return;
   const KEYS=['pilotpro_v2','dbs_overrides_2026','dbs_couts_articles_2026','dbs_deleted_2026','dbs_paiements_2026','dbs_comptes_bancaires','dbs_activity_log','dbs_cmd_photos','dbs_gpao_prod_v2','dbs_grandlivre_2026_v2','dbs_taux_eur'];
-  const API='/api/state';
+  const API='/api/state', LTS='pp_local_ts';
   let rev=0,lastKnown={},busy=false;
   function snap(){ const o={}; KEYS.forEach(k=>{ const v=localStorage.getItem(k); if(v!=null) o[k]=v; }); return o; }
   function dirtyKeys(){ const s=snap(); const d=[]; KEYS.forEach(k=>{ const a=(k in s)?s[k]:null, b=(k in lastKnown)?lastKnown[k]:null; if(a!==b) d.push(k); }); return d; }
   function applyKeys(keys,skip){ KEYS.forEach(k=>{ if(skip&&skip.indexOf(k)>=0) return; const v=(keys&&(k in keys))?keys[k]:null; if(v==null) return; if(localStorage.getItem(k)!==v){ try{ localStorage.setItem(k,v); }catch(e){} } }); }
   function setDot(ok,txt){ const el=document.getElementById('pp-sync'); if(el){ el.style.background=ok?'#16a34a':'#dc2626'; }
     const t=document.getElementById('pp-sync-t'); if(t) t.textContent=txt||(ok?'Serveur \u00b7 \u00e0 jour':'Hors-ligne'); }
+  async function pushAll(baseKeys,msg){
+    try{
+      const merged=Object.assign({},baseKeys||{},snap());
+      const ts=Date.now();
+      const p=await fetch(API,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys:merged,ts:ts})});
+      const pd=await p.json(); rev=pd.rev||rev; sessionStorage.setItem('pp_rev',rev);
+      lastKnown=merged; try{ localStorage.setItem(LTS,String(ts)); }catch(e){}
+      if(msg) console.log('[sync]',msg);
+      return true;
+    }catch(e){ return false; }
+  }
   async function seed(){
     if(sessionStorage.getItem('pp_synced')==='1'){ rev=+(sessionStorage.getItem('pp_rev')||0); start(); return; }
     try{
       const r=await fetch(API,{cache:'no-store'}); const d=await r.json(); const keys=d.keys||{};
-      if(Object.keys(keys).length){ KEYS.forEach(k=>{ if(keys[k]!=null){ try{ localStorage.setItem(k,keys[k]); }catch(e){} } }); }
-      rev=d.rev||0; sessionStorage.setItem('pp_rev',rev); sessionStorage.setItem('pp_synced','1');
+      const srvHas=Object.keys(keys).length>0;
+      const localHas=KEYS.some(k=>localStorage.getItem(k)!=null);
+      const localTs=+(localStorage.getItem(LTS)||0);
+      const srvTs=+(d.ts||0);
+      sessionStorage.setItem('pp_synced','1');
+      rev=d.rev||0; sessionStorage.setItem('pp_rev',rev);
+      if(!srvHas){
+        /* Serveur vide (nouveau d\u00e9ploiement) : NE RIEN \u00e9craser, renvoyer nos donn\u00e9es */
+        if(localHas) await pushAll(null,'serveur vide \u2014 donn\u00e9es de ce poste renvoy\u00e9es');
+        start(); return;
+      }
+      if(localHas && localTs>srvTs){
+        /* Ce poste est plus r\u00e9cent que le serveur : le plus r\u00e9cent gagne */
+        await pushAll(keys,'donn\u00e9es locales plus r\u00e9centes conserv\u00e9es et renvoy\u00e9es au serveur');
+        start(); return;
+      }
+      /* Cas normal : le serveur fait foi \u2014 copie de s\u00e9curit\u00e9 locale d'abord */
+      try{ if(localHas){ const js=JSON.stringify({_date:new Date().toISOString(),keys:snap()}); if(js.length<2500000) localStorage.setItem('pp_preseed_backup',js); } }catch(e){}
+      KEYS.forEach(k=>{ if(keys[k]!=null){ try{ localStorage.setItem(k,keys[k]); }catch(e){} } });
+      if(srvTs){ try{ localStorage.setItem(LTS,String(srvTs)); }catch(e){} }
       location.reload(); return;
     }catch(e){ console.warn('[sync] serveur injoignable \u2014 mode local',e); sessionStorage.setItem('pp_synced','1'); start(); }
   }
@@ -7385,11 +7493,12 @@ if(document.readyState!=='loading'){ askName(); load().then(listScreen); }
       const r=await fetch(API,{cache:'no-store'}); const d=await r.json(); const merged=d.keys||{};
       const s=snap();
       dk.forEach(k=>{ if(k in s) merged[k]=s[k]; else delete merged[k]; });
-      const p=await fetch(API,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys:merged,baseRev:rev})});
+      const ts=Date.now();
+      const p=await fetch(API,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys:merged,ts:ts})});
       const pd=await p.json();
       rev=pd.rev||rev; sessionStorage.setItem('pp_rev',rev);
       applyKeys(merged,dk);
-      lastKnown=merged;
+      lastKnown=merged; try{ localStorage.setItem(LTS,String(ts)); }catch(e){}
       setDot(true);
     }catch(e){ setDot(false); }
     busy=false;
@@ -7403,6 +7512,7 @@ if(document.readyState!=='loading'){ askName(); load().then(listScreen); }
         const keys=d.keys||{};
         applyKeys(keys,null);
         lastKnown=keys; rev=d.rev||0; sessionStorage.setItem('pp_rev',rev);
+        if(d.ts){ try{ localStorage.setItem(LTS,String(d.ts)); }catch(e){} }
         setDot(true,'Serveur \u00b7 mise \u00e0 jour re\u00e7ue');
         setTimeout(function(){ setDot(true); },2500);
       } else setDot(true);
@@ -7425,7 +7535,7 @@ if(document.readyState!=='loading'){ askName(); load().then(listScreen); }
         const dk=dirtyKeys(); if(!dk.length) return;
         const s=snap(); const merged=Object.assign({},lastKnown);
         dk.forEach(k=>{ if(k in s) merged[k]=s[k]; else delete merged[k]; });
-        navigator.sendBeacon && navigator.sendBeacon(API,new Blob([JSON.stringify({keys:merged,baseRev:rev})],{type:'application/json'}));
+        navigator.sendBeacon && navigator.sendBeacon(API,new Blob([JSON.stringify({keys:merged,ts:Date.now()})],{type:'application/json'}));
       }catch(e){}
     });
   }
