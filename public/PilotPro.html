@@ -2799,6 +2799,14 @@ function startApp(){
   document.getElementById('user-av').textContent = CURRENT_USER.name[0].toUpperCase();
   buildNav();
   startClock();
+  try{
+    if(CURRENT_USER && CURRENT_USER.role==='admin'){
+      const _abT=todayISO();
+      if(localStorage.getItem('dbs_auto_backup_last')!==_abT){
+        setTimeout(function(){ try{ backupData(true); localStorage.setItem('dbs_auto_backup_last',_abT); toast('\ud83d\udcbe Sauvegarde quotidienne export\u00e9e automatiquement \u2014 dossier T\u00e9l\u00e9chargements','ok'); }catch(e){} }, 12000);
+      }
+    }
+  }catch(e){}
   // Bouton flottant : imprimer le rapport du module courant
   if(!document.getElementById('print-fab')){
     const b=document.createElement('button');
@@ -3536,26 +3544,36 @@ function cmdThumb(o){ const ph=PHOTOS[o.id]; const s=cmdImgSize();
   if(ph) return '<img src="'+ph+'" onclick="viewPhoto('+o.id+')" title="Voir / modifier la photo" style="width:'+s+'px;height:'+s+'px;object-fit:cover;border-radius:5px;cursor:pointer;border:1px solid var(--line);flex:0 0 auto">';
   return '<button onclick="addPhoto('+o.id+')" title="Ajouter une photo / croquis" style="width:'+s+'px;height:'+s+'px;border:1px dashed var(--line);border-radius:5px;background:var(--bg);cursor:pointer;color:var(--ink-3);font-size:'+Math.round(s/2.6)+'px;flex:0 0 auto">\ud83d\udcf7</button>';
 }
-function _downscaleImage(file, cb){ const reader=new FileReader(); reader.onload=e=>{ const img=new Image(); img.onload=()=>{ const max=380; let w=img.width,h=img.height; if(w>h){ if(w>max){ h=Math.round(h*max/w); w=max; } } else { if(h>max){ w=Math.round(w*max/h); h=max; } } const cv=document.createElement("canvas"); cv.width=w; cv.height=h; cv.getContext("2d").drawImage(img,0,0,w,h); try{ cb(cv.toDataURL("image/jpeg",0.7)); }catch(err){ cb(cv.toDataURL()); } }; img.onerror=()=>toast("Image illisible","err"); img.src=e.target.result; }; reader.readAsDataURL(file); }
+function _downscaleImage(file, cb){ const reader=new FileReader(); reader.onload=e=>{ const img=new Image(); img.onload=()=>{ const max=380; let w=img.width,h=img.height; if(w>h){ if(w>max){ h=Math.round(h*max/w); w=max; } } else { if(h>max){ w=Math.round(w*max/h); h=max; } } const cv=document.createElement("canvas"); cv.width=w; cv.height=h; const cx=cv.getContext("2d"); cx.fillStyle="#ffffff"; cx.fillRect(0,0,w,h); cx.drawImage(img,0,0,w,h); try{ cb(cv.toDataURL("image/jpeg",0.7)); }catch(err){ cb(cv.toDataURL()); } }; img.onerror=()=>toast("Image illisible","err"); img.src=e.target.result; }; reader.readAsDataURL(file); }
 function addPhoto(id){ photoMenu(id); }
 function photoMenu(id){
   openModal('\ud83d\udcf7 Photo / croquis',
     '<div style="display:flex;flex-direction:column;gap:10px">'+
-    '<button class="btn pri" style="width:100%" onclick="pickPhotoFile('+id+')">\ud83d\udcc1 Choisir un fichier</button>'+
+    '<button class="btn pri" style="width:100%" onclick="pickPhotoFile('+id+')">\ud83d\udcc1 Choisir un fichier (PNG, JPG\u2026)</button>'+
     '<div style="text-align:center;font-size:12px;color:var(--ink-3)">\u2014 ou \u2014</div>'+
-    '<div style="font-size:12px;color:var(--ink-3)">Cliquez dans le cadre puis <b>collez (Ctrl+V)</b>, ou glissez-d\u00e9posez une image :</div>'+
-    '<div id="paste-zone" contenteditable="true" tabindex="0" data-id="'+id+'" style="border:2px dashed var(--brand);border-radius:10px;min-height:90px;padding:18px;text-align:center;color:var(--ink-3);outline:none;background:var(--bg)">Collez l\u0027image ici\u2026</div>'+
+    '<div id="paste-zone" tabindex="0" style="border:2px dashed var(--brand);border-radius:10px;min-height:96px;padding:16px;text-align:center;color:var(--ink-3);outline:none;background:var(--bg)"><div style="font-size:20px">\ud83d\udccb</div><div style="margin-top:4px">Copiez une image puis appuyez sur <b>Ctrl+V</b><br><span style="font-size:11px">(n\u0027importe o\u00f9 \u2014 tant que cette fen\u00eatre est ouverte)</span></div><div style="font-size:11px;opacity:.7;margin-top:4px">ou glissez-d\u00e9posez le fichier ici</div></div>'+
     '</div>',
     '<button class="btn" onclick="closeModal()">Fermer</button>');
-  const z=document.getElementById('paste-zone'); if(!z) return;
-  const done=(u,how)=>{ PHOTOS[id]=u; if(savePhotos()){ if(typeof logAct==='function')logAct('photo','photo '+how+' #'+id); closeModal(); MODULES.commandes.render(); toast('Photo ajout\u00e9e','ok'); } };
-  const clearPh=()=>{ if((z.textContent||'').indexOf('Collez')>=0) z.innerHTML=''; };
-  z.addEventListener('focus',clearPh); z.addEventListener('click',clearPh);
-  z.addEventListener('paste',ev=>{ const items=(ev.clipboardData&&ev.clipboardData.items)||[]; for(let i=0;i<items.length;i++){ const it=items[i]; if(it.type&&it.type.indexOf('image')===0){ ev.preventDefault(); _downscaleImage(it.getAsFile(),u=>done(u,'coll\u00e9e')); return; } } ev.preventDefault(); setTimeout(()=>{ z.innerHTML=''; },10); toast('Aucune image dans le presse-papier \u2014 copiez d\u0027abord une image','err'); });
-  z.addEventListener('dragover',e=>{ e.preventDefault(); z.style.background='var(--brand-l)'; });
-  z.addEventListener('dragleave',()=>{ z.style.background='var(--bg)'; });
-  z.addEventListener('drop',e=>{ e.preventDefault(); z.style.background='var(--bg)'; const file=e.dataTransfer&&e.dataTransfer.files&&e.dataTransfer.files[0]; if(file&&file.type.indexOf('image')===0) _downscaleImage(file,u=>done(u,'d\u00e9pos\u00e9e')); else toast('D\u00e9posez un fichier image','err'); });
-  setTimeout(()=>z.focus(),60);
+  var done=function(u,how){ PHOTOS[id]=u; if(savePhotos()){ if(typeof logAct==='function')logAct('photo','photo '+how+' #'+id); closeModal(); MODULES.commandes.render(); toast('Photo ajout\u00e9e','ok'); } };
+  var grab=function(dt){ if(!dt) return null;
+    var items=dt.items||[];
+    for(var i=0;i<items.length;i++){ var it=items[i]; if(it.type&&it.type.indexOf('image')===0){ var ff=it.getAsFile&&it.getAsFile(); if(ff) return ff; } }
+    var files=dt.files||[];
+    for(var j=0;j<files.length;j++){ if(files[j].type&&files[j].type.indexOf('image')===0) return files[j]; }
+    return null; };
+  var onPaste=function(ev){
+    var zone=document.getElementById('paste-zone');
+    if(!zone){ document.removeEventListener('paste',onPaste,true); return; }
+    var ff=grab(ev.clipboardData);
+    if(ff){ ev.preventDefault(); ev.stopPropagation(); zone.innerHTML='<div style="font-size:13px;color:var(--brand);font-weight:700;padding:20px">\u23f3 Image re\u00e7ue \u2014 compression\u2026</div>'; _downscaleImage(ff,function(u){ done(u,'coll\u00e9e'); }); }
+    else { zone.style.borderColor='var(--danger)'; setTimeout(function(){ zone.style.borderColor='var(--brand)'; },900); toast('Le presse-papier ne contient pas d\u0027image \u2014 faites d\u0027abord clic droit \u2192 \u00ab Copier l\u0027image \u00bb','err'); }
+  };
+  document.addEventListener('paste',onPaste,true);
+  var z=document.getElementById('paste-zone'); if(!z) return;
+  z.addEventListener('dragover',function(e){ e.preventDefault(); z.style.background='var(--brand-l)'; });
+  z.addEventListener('dragleave',function(){ z.style.background='var(--bg)'; });
+  z.addEventListener('drop',function(e){ e.preventDefault(); z.style.background='var(--bg)'; var ff=grab(e.dataTransfer); if(ff) _downscaleImage(ff,function(u){ done(u,'d\u00e9pos\u00e9e'); }); else toast('D\u00e9posez un fichier image (PNG, JPG\u2026)','err'); });
+  setTimeout(function(){ try{ z.focus(); }catch(e){} },60);
 }
 function pickPhotoFile(id){ const inp=document.createElement("input"); inp.type="file"; inp.accept="image/*"; inp.onchange=()=>{ const file=inp.files&&inp.files[0]; if(!file) return; _downscaleImage(file,url=>{ PHOTOS[id]=url; if(savePhotos()){ if(typeof logAct==="function")logAct("photo","photo commande #"+id); closeModal(); MODULES.commandes.render(); toast("Photo ajout\u00e9e","ok"); } }); }; inp.click(); }
 function viewPhoto(id){ const ph=PHOTOS[id]; if(!ph){ addPhoto(id); return; } const o=ds.orders.find(x=>x.id===id);
@@ -7009,14 +7027,14 @@ function reimportFact(){
   toast('Import : '+r.nc+' clients, '+r.nf+' façonniers, '+r.no+' commandes','ok');
   if(typeof nav==='function')nav('stats');
 }
-function backupData(){
-  const KEYS=['pilotpro_v2','dbs_overrides_2026','dbs_couts_articles_2026','dbs_deleted_2026','dbs_gpao_prod_v2','dbs_grandlivre_2026_v2','dbs_taux_eur'];
+function backupData(auto){
+  const KEYS=['pilotpro_v2','dbs_overrides_2026','dbs_couts_articles_2026','dbs_deleted_2026','dbs_paiements_2026','dbs_comptes_bancaires','dbs_activity_log','dbs_cmd_photos','dbs_gpao_prod_v2','dbs_grandlivre_2026_v2','dbs_taux_eur'];
   const keys={}; KEYS.forEach(k=>{ const v=localStorage.getItem(k); if(v!=null) keys[k]=v; });
   const backup={_app:'PilotPro',_version:2,_type:'global',_date:new Date().toISOString(),keys:keys};
   const a=document.createElement('a');
   a.href=URL.createObjectURL(new Blob([JSON.stringify(backup,null,2)],{type:'application/json'}));
-  a.download='PilotPro_sauvegarde_complete_'+todayISO()+'.json'; a.click();
-  toast('Sauvegarde complète exportée ('+Object.keys(keys).length+' modules)','ok');
+  a.download='PilotPro_sauvegarde_'+(auto?'auto_':'complete_')+todayISO()+'.json'; a.click();
+  if(!auto) toast('Sauvegarde complète exportée ('+Object.keys(keys).length+' modules)','ok');
 }
 function restoreData(input){
   const f=input.files[0]; if(!f){return;}

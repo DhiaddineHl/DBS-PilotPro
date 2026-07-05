@@ -34,14 +34,22 @@ function hourStamp(d) {
   const p = n => String(n).padStart(2, '0');
   return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + '_' + p(d.getHours()) + 'h';
 }
-/* Sauvegarde horaire : on conserve l'état TEL QU'IL ÉTAIT au début de chaque heure */
+/* Sauvegardes automatiques : horaires (≈10 j) + QUOTIDIENNES (60 j) */
+function prune(rx, max) {
+  const files = fs.readdirSync(BKDIR).filter(x => rx.test(x)).sort();
+  while (files.length > max) { fs.unlinkSync(path.join(BKDIR, files.shift())); }
+}
 function hourlyBackup(prevState) {
   try {
     if (!prevState || !prevState.keys || !Object.keys(prevState.keys).length) return;
-    const f = path.join(BKDIR, 'state-' + hourStamp(new Date()) + '.json');
-    if (!fs.existsSync(f)) fs.writeFileSync(f, JSON.stringify(prevState));
-    const files = fs.readdirSync(BKDIR).filter(x => /^state-.*\.json$/.test(x)).sort();
-    while (files.length > BK_MAX) { fs.unlinkSync(path.join(BKDIR, files.shift())); }
+    const now = new Date();
+    const p = n => String(n).padStart(2, '0');
+    const hf = path.join(BKDIR, 'state-' + hourStamp(now) + '.json');
+    if (!fs.existsSync(hf)) fs.writeFileSync(hf, JSON.stringify(prevState));
+    const df = path.join(BKDIR, 'state-daily-' + now.getFullYear() + '-' + p(now.getMonth() + 1) + '-' + p(now.getDate()) + '.json');
+    if (!fs.existsSync(df)) fs.writeFileSync(df, JSON.stringify(prevState));
+    prune(/^state-\d{4}-.*\.json$/, BK_MAX);     // horaires
+    prune(/^state-daily-.*\.json$/, 60);          // quotidiennes
   } catch (e) { console.warn('backup:', e.message); }
 }
 
