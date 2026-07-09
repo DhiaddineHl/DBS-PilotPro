@@ -2787,6 +2787,16 @@ function logout(){
   sessionStorage.removeItem('pp_user');
   location.reload();
 }
+function saveNow(){
+  try{ if(typeof DB!=='undefined' && DB.save) DB.save(); }catch(e){}
+  var fab=document.getElementById('save-fab'); if(fab){ fab.disabled=true; var old=fab.innerHTML; fab.innerHTML='\u23f3 Envoi\u2026';
+    var restore=function(ok){ fab.innerHTML=ok?'\u2713 Enregistr\u00e9':'\u26a0 Hors-ligne'; fab.style.background=ok?'#16a34a':'#dc2626'; setTimeout(function(){ fab.innerHTML=old; fab.style.background='#16a34a'; fab.disabled=false; },1800); };
+    if(window.__ppSync){ try{ Promise.resolve(window.__ppSync()).then(function(){restore(true);}).catch(function(){restore(false);}); setTimeout(function(){ if(fab.disabled) restore(true); },2500); }catch(e){ restore(false); } }
+    else { restore(true); }
+  }
+  if(typeof logAct==='function') logAct('enregistrement','sauvegarde manuelle');
+  if(typeof toast==='function') toast('\ud83d\udcbe Donn\u00e9es enregistr\u00e9es et synchronis\u00e9es','ok');
+}
 function startApp(){
   loadActivity();
   loadPhotos();
@@ -2799,6 +2809,13 @@ function startApp(){
   document.getElementById('user-av').textContent = CURRENT_USER.name[0].toUpperCase();
   buildNav();
   startClock();
+  try{ if(!document.getElementById('save-fab')){
+    var fab=document.createElement('button'); fab.id='save-fab';
+    fab.title='Enregistrer et synchroniser maintenant sur le serveur';
+    fab.innerHTML='\ud83d\udcbe Enregistrer';
+    fab.style.cssText='position:fixed;bottom:22px;right:22px;z-index:96;background:#16a34a;color:#fff;border:none;border-radius:26px;padding:13px 20px;font:800 14px system-ui;cursor:pointer;box-shadow:0 6px 20px rgba(22,163,74,.45)';
+    fab.onclick=saveNow; document.body.appendChild(fab);
+  } }catch(e){}
   try{
     if(CURRENT_USER && CURRENT_USER.role==='admin'){
       const _abT=todayISO();
@@ -2860,6 +2877,7 @@ const NAV_STRUCTURE = [
   ]},
   {grp:'3 · Préparation', stage:3, items:[
     {id:'planning', ico:'🗓️', label:'Planning général'},
+    {id:'planfacon', ico:'📅', label:'Prévision planning mensuel'},
     {id:'coupe', ico:'✂️', label:'Service Coupe'},
     {id:'be', ico:'📐', label:'Bureau d\'Études', badge:'be'},
     {id:'prevexport', ico:'🚢', label:'Prévision Export'},
@@ -3357,7 +3375,7 @@ MODULES.commandes = {
       <span style="font-size:11px;color:var(--ink-3);display:inline-flex;align-items:center;gap:3px">📷 <button class="btn xs" onclick="cmdSetImgSize(32)" title="Petites">S</button><button class="btn xs" onclick="cmdSetImgSize(48)" title="Moyennes">M</button><button class="btn xs" onclick="cmdSetImgSize(72)" title="Grandes">L</button></span>
       <input id="cmd-q" placeholder="Rechercher modèle…" oninput="MODULES.commandes.render()" style="width:200px">
     </div>
-    <div class="panel"><div class="panel-head"><span class="panel-title">Commandes</span><span class="tag b" id="cmd-cnt">0</span><span id="cmd-sel" style="margin-left:auto;font-size:12px;color:var(--ink-3)"></span><button class="btn xs" onclick="printCmdSelection()" style="margin-left:10px" title="Imprimer uniquement les commandes cochées">🖨 Imprimer la sélection</button></div>
+    <div class="panel"><div class="panel-head"><span class="panel-title">Commandes</span><span class="tag b" id="cmd-cnt">0</span><span id="cmd-sel" style="margin-left:auto;font-size:12px;color:var(--ink-3)"></span><button class="btn xs" onclick="printCmdSelection()" style="margin-left:10px" title="Imprimer uniquement les commandes cochées">🖨 Imprimer la sélection</button><button class="btn xs pri" onclick="sendSelToPrevExport()" style="margin-left:6px" title="Envoyer les commandes cochées vers Prévision Export">🚢 Envoyer en prévision</button></div>
     <div class="panel-body flush"><div class="tbl-wrap"><table class="tbl"><thead><tr>
       <th style="width:30px;text-align:center"><input type="checkbox" id="cmd-check-all" onclick="cmdToggleAll(this.checked)" title="Tout cocher"></th><th>N° OF</th><th>Modèle</th><th>Client</th><th>Assigné</th><th>Qté</th><th>P. vente</th><th>P. façon</th><th>Marge</th><th>Export</th><th>Retard</th><th>Avancement</th><th>Statut</th><th></th>
     </tr></thead><tbody id="cmd-body"></tbody></table></div></div></div>`;
@@ -3699,7 +3717,90 @@ function detectDoublons(){
 /* ═══════════ #8 Classement automatique des commandes ═══════════ */
 const AUTO_STATUT_LBL={preparation:{t:'En préparation',c:'n',ico:'📋'},production:{t:'En production',c:'b',ico:'🏭'},terminee:{t:'Terminée',c:'p',ico:'✅'},livree:{t:'Livrée',c:'g',ico:'📦'},retard:{t:'En retard',c:'r',ico:'⚠'}};
 function autoStatutTag(o){ const s=biz.autoStatut(o); const m=AUTO_STATUT_LBL[s]||AUTO_STATUT_LBL.preparation; return '<span class="tag '+m.c+'" style="font-size:9px;white-space:nowrap">'+m.ico+' '+m.t+'</span>'; }
-/* ═══════════ #10 Prévision Export ═══════════ */
+/* ═══════════ Prévision planning mensuel par façonnier ═══════════ */
+function _pfMonth(){ var el=document.getElementById('pf-month'); return (el&&el.value)|| (todayISO().slice(0,7)); }
+function _pfFac(){ var el=document.getElementById('pf-fac'); return (el&&el.value)||''; }
+function planFaconData(ym){
+  var res={};
+  (ds.orders||[]).forEach(function(o){
+    if(o.statut==='archived') return;
+    var d=o.exportPrev||o.date_export||''; if(String(d).slice(0,7)!==ym) return;
+    var fac=o.faconnier|| (o.chaine_id?'\ud83c\udfed Interne':'\u26a0 Non assign\u00e9');
+    if(!res[fac]) res[fac]={cmd:0,pcs:0,mt:0,rows:[]};
+    var q=+o.qte||0, pf=+o.prix_facon||0;
+    res[fac].cmd++; res[fac].pcs+=q; res[fac].mt+=pf*q;
+    res[fac].rows.push(o);
+  });
+  return {facons:Object.keys(res).sort(), map:res};
+}
+MODULE_SUBTITLES.planfacon='Pr\u00e9vision planning mensuel par façonnier \u2014 charge et facturation pr\u00e9visionnelles par sous-traitant sur le mois';
+MODULES.planfacon={
+  html(){ return `
+    <div class="page-head" style="margin-bottom:12px">
+      <div><h1>\ud83d\udcc5 Pr\u00e9vision planning mensuel</h1><p>Charge et facturation pr\u00e9visionnelles par façonnier \u2014 bas\u00e9es sur les dates d'export pr\u00e9vues</p></div>
+      <div class="page-actions">
+        <input type="month" id="pf-month" onchange="MODULES.planfacon.render()" style="padding:8px 10px;border:1px solid var(--line);border-radius:8px">
+        <select id="pf-fac" onchange="MODULES.planfacon.render()" style="padding:8px 10px;border:1px solid var(--line);border-radius:8px"><option value="">Tous les façonniers</option></select>
+        <button class="btn" onclick="printPlanFacon()">\ud83d\udda8 Imprimer / PDF</button>
+      </div>
+    </div>
+    <div id="pf-kpis" class="kpi-row" style="margin-bottom:14px"></div>
+    <div id="pf-body"></div>`;
+  },
+  render(){
+    var mEl=document.getElementById('pf-month'); if(mEl && !mEl.value) mEl.value=todayISO().slice(0,7);
+    var ym=_pfMonth(); var d=planFaconData(ym);
+    var sel=document.getElementById('pf-fac');
+    if(sel){ var cur=sel.value; sel.innerHTML='<option value="">Tous les façonniers</option>'+d.facons.map(function(fc){ return '<option value="'+esc(fc)+'"'+(fc===cur?' selected':'')+'>'+esc(fc)+'</option>'; }).join(''); }
+    var filt=_pfFac();
+    var facs=filt?d.facons.filter(function(fc){return fc===filt;}):d.facons;
+    var totCmd=0,totPcs=0,totMt=0; facs.forEach(function(fc){ totCmd+=d.map[fc].cmd; totPcs+=d.map[fc].pcs; totMt+=d.map[fc].mt; });
+    var kp=document.getElementById('pf-kpis');
+    if(kp) kp.innerHTML=kpi('Façonniers',facs.length,{ico:'\ud83c\udfed',color:'var(--brand)'})+kpi('Commandes',totCmd,{ico:'\ud83d\udce6',color:'var(--ok)'})+kpi('Pièces à produire',fmt.n(totPcs),{ico:'\ud83e\uddf5',color:'var(--purple)'})+kpi('Facturation façon (mois)',fmt.eur(Math.round(totMt)),{ico:'\ud83d\udcb6',color:'#b45309',sub:'<span style="font-size:10px;color:var(--ink-3)">prix façon \u00d7 quantit\u00e9s</span>'});
+    var box=document.getElementById('pf-body'); if(!box) return;
+    if(!facs.length){ box.innerHTML='<div class="empty" style="text-align:center;padding:50px;color:var(--ink-3)">Aucune commande pr\u00e9vue en '+ym+(filt?' pour '+esc(filt):'')+'.<br><span style="font-size:12px">Astuce : cochez des commandes et cliquez \u00ab \ud83d\udea2 Envoyer en pr\u00e9vision \u00bb, ou renseignez leur date d\'export.</span></div>'; return; }
+    box.innerHTML=facs.map(function(fc){
+      var g=d.map[fc];
+      var rows=g.rows.slice().sort(function(a,b){return String(a.exportPrev||a.date_export||'').localeCompare(String(b.exportPrev||b.date_export||''));}).map(function(o){
+        var q=+o.qte||0, pf=+o.prix_facon||0, mt=pf*q;
+        return '<tr><td>'+cmdThumb(o)+'</td><td><b>'+esc(o.modele||'')+'</b>'+(o.ref_article?'<div style="font-size:10px;color:var(--ink-3)">'+esc(o.ref_article)+'</div>':'')+'</td><td>'+esc(o.client||'')+'</td><td style="text-align:right"><b>'+fmt.n(q)+'</b></td><td style="text-align:right">'+(pf?fmt.d(pf)+'\u202f\u20ac':'\u2014')+'</td><td style="text-align:right"><b>'+(mt?fmt.eur(Math.round(mt)):'\u2014')+'</b></td><td>'+esc(o.exportPrev||o.date_export||'\u2014')+'</td><td>'+esc(o.recept_tissu||'\u2014')+'</td></tr>';
+      }).join('');
+      return '<div class="panel" style="margin-bottom:14px"><div class="panel-head"><span class="panel-title">\ud83c\udfed '+esc(fc)+'</span><span style="margin-left:auto;font-size:12px;color:var(--ink-3)">'+g.cmd+' cmd \u00b7 <b>'+fmt.n(g.pcs)+'</b> pi\u00e8ces \u00b7 facturation \u2248 <b style="color:#b45309">'+fmt.eur(Math.round(g.mt))+'</b></span></div>'+
+        '<div class="panel-body flush"><div class="tbl-wrap"><table class="tbl"><thead><tr><th style="width:54px"></th><th>Mod\u00e8le</th><th>Client</th><th style="text-align:right">Qt\u00e9</th><th style="text-align:right">P. façon/pc</th><th style="text-align:right">Montant façon</th><th>Export pr\u00e9vu</th><th>R\u00e9ception tissu</th></tr></thead><tbody>'+rows+
+        '<tr style="background:var(--bg);font-weight:800"><td></td><td>TOTAL '+esc(fc)+'</td><td></td><td style="text-align:right">'+fmt.n(g.pcs)+'</td><td></td><td style="text-align:right;color:#b45309">'+fmt.eur(Math.round(g.mt))+'</td><td></td><td></td></tr>'+
+        '</tbody></table></div></div></div>';
+    }).join('');
+  }
+};
+function printPlanFacon(){
+  var ym=_pfMonth(); var d=planFaconData(ym);
+  var filt=_pfFac();
+  var facs=filt?d.facons.filter(function(fc){return fc===filt;}):d.facons;
+  if(!facs.length){ toast('Rien \u00e0 imprimer pour ce mois','err'); return; }
+  var moisNom=new Date(ym+'-01T00:00:00').toLocaleDateString('fr-FR',{month:'long',year:'numeric'});
+  var blocks=facs.map(function(fc){ var g=d.map[fc];
+    var rows=g.rows.slice().sort(function(a,b){return String(a.exportPrev||a.date_export||'').localeCompare(String(b.exportPrev||b.date_export||''));}).map(function(o){
+      var q=+o.qte||0, pf=+o.prix_facon||0, mt=pf*q;
+      return '<tr><td>'+esc(o.modele||'')+'</td><td>'+esc(o.ref_article||'')+'</td><td>'+esc(o.client||'')+'</td><td style="text-align:right">'+fmt.n(q)+'</td><td style="text-align:right">'+(pf?fmt.d(pf)+' \u20ac':'')+'</td><td style="text-align:right"><b>'+(mt?fmt.eur(Math.round(mt)):'')+'</b></td><td>'+esc(o.exportPrev||o.date_export||'')+'</td><td>'+esc(o.recept_tissu||'')+'</td></tr>';
+    }).join('');
+    return '<h2 style="margin:16px 0 4px;font-size:14px">\ud83c\udfed '+esc(fc)+' <span style="font-weight:400;color:#667;font-size:12px">\u2014 '+g.cmd+' cmd \u00b7 '+fmt.n(g.pcs)+' pi\u00e8ces \u00b7 facturation \u2248 <b>'+fmt.eur(Math.round(g.mt))+'</b></span></h2><table><thead><tr><th>Mod\u00e8le</th><th>R\u00e9f</th><th>Client</th><th>Qt\u00e9</th><th>P. façon/pc</th><th>Montant façon</th><th>Export</th><th>Tissu</th></tr></thead><tbody>'+rows+
+      '<tr style="background:#f1f5f9;font-weight:700"><td colspan="3">TOTAL '+esc(fc)+'</td><td style="text-align:right">'+fmt.n(g.pcs)+'</td><td></td><td style="text-align:right">'+fmt.eur(Math.round(g.mt))+'</td><td></td><td></td></tr></tbody></table>';
+  }).join('');
+  var totPcs=0,totCmd=0,totMt=0; facs.forEach(function(fc){ totPcs+=d.map[fc].pcs; totCmd+=d.map[fc].cmd; totMt+=d.map[fc].mt; });
+  var w=window.open('','_blank'); if(!w){ toast('Autorisez les pop-ups','err'); return; }
+  w.document.write('<!doctype html><html><head><meta charset="utf-8"><title>Pr\u00e9vision '+ym+'</title><style>body{font-family:system-ui,Arial;margin:24px;color:#1e293b}h1{font-size:20px;margin:0}table{width:100%;border-collapse:collapse;font-size:11px;margin-top:4px}th,td{border:1px solid #cbd5e1;padding:5px 7px;text-align:left}th{background:#f1f5f9}.head{border-bottom:3px solid #0f172a;padding-bottom:9px;margin-bottom:6px}@media print{body{margin:12mm}}</style></head><body><div class="head"><h1>DBS Fashion \u2014 Pr\u00e9vision planning mensuel'+(filt?' \u2014 '+esc(filt):' par façonnier')+'</h1><div style="font-size:12px;color:#64748b">'+moisNom+' \u00b7 '+facs.length+' façonnier(s) \u00b7 '+totCmd+' commande(s) \u00b7 '+fmt.n(totPcs)+' pi\u00e8ces \u00b7 facturation totale \u2248 <b>'+fmt.eur(Math.round(totMt))+'</b></div></div>'+blocks+'<scr'+'ipt>window.onload=function(){window.print()}</scr'+'ipt></body></html>');
+  w.document.close();
+}
+function sendSelToPrevExport(){
+  var ids=[].slice.call(document.querySelectorAll('#'+cmdPfx()+'-body .cmd-chk:checked')).map(function(c){return +c.getAttribute('data-id');});
+  if(!ids.length){ toast('Cochez d\'abord des commandes','err'); return; }
+  var d=prompt('Date pr\u00e9visionnelle d\'expédition pour les '+ids.length+' commande(s) coch\u00e9es (AAAA-MM-JJ) :', todayISO());
+  if(!d) return;
+  var n=0; ids.forEach(function(id){ var o=ds.orders.find(function(x){return x.id===id;}); if(o){ o.exportPrev=d; if(!o.statutLog)o.statutLog='attente'; n++; } });
+  DB.save(); if(typeof logAct==='function')logAct('prevexport','envoi group\u00e9 de '+n+' commande(s) \u2192 '+d);
+  toast('\ud83d\udea2 '+n+' commande(s) envoy\u00e9e(s) en Pr\u00e9vision Export ('+d+')','ok');
+  if(currentPage==='prevexport' && MODULES.prevexport) MODULES.prevexport.render();
+}
 function sendToPrevExport(id){
   const o=ds.orders.find(x=>x.id===id); if(!o)return;
   const d=prompt('Date prévisionnelle d\'expédition (AAAA-MM-JJ) :', o.exportPrev||o.date_export||todayISO());
@@ -4262,7 +4363,9 @@ function ouvriereRendement(key){
     earnedTot+=earned; workedTot+=worked; piecesTot+=pieces; retTot+=ret;
   });
   if(!perJour.length) return {found:false, nom:foundNom, matricule:matr||key, poste:poste||''};
-  var general=workedTot>0?Math.round(earnedTot/(workedTot*3600)*100):null;
+  /* Aligné sur GPAO / Historique ouvrière : moyenne SIMPLE des rendements journaliers (pas pondérée) */
+  var _sumR=0,_nR=0; perJour.forEach(function(pj){ if(pj.rend!==null){ _sumR+=pj.rend; _nR++; } });
+  var general=_nR?Math.round(_sumR/_nR):null;
   return {found:true, nom:foundNom, matricule:matr||'\u2014', poste:poste||'', general:general, today:perJour[perJour.length-1], perJour:perJour, piecesTot:piecesTot, retTot:retTot};
 }
 function _rcol(p){ return p>=75?'#22c55e':(p>=60?'#f59e0b':'#ef4444'); }
@@ -7547,7 +7650,7 @@ if(document.readyState!=='loading') render(); else document.addEventListener('DO
     bar(); lastKnown=snap(); setDot(true);
     setInterval(push,4000);
     setInterval(pull,5000);
-    window.__ppSync=function(){ push().then(pull); };
+    window.__ppSync=function(){ return push().then(pull); };
     window.addEventListener('beforeunload',function(){
       try{
         const dk=dirtyKeys(); if(!dk.length) return;
