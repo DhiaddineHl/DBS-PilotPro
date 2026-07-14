@@ -88,6 +88,14 @@ const server = http.createServer((req, res) => {
       try {
         const incoming = JSON.parse(body || '{}');
         const cur = loadState();
+        /* Garde anti-écrasement : si le client annonce sa révision de base (baseRev)
+           et qu'elle ne correspond plus à celle du serveur alors que le serveur a des
+           données, un autre poste a enregistré entre-temps → refus (le client affichera
+           le conflit). L'envoi forcé (sans baseRev) reste possible depuis le dialogue. */
+        if (typeof incoming.baseRev === 'number' && cur.keys && Object.keys(cur.keys).length > 0 && incoming.baseRev !== (cur.rev || 0)) {
+          json(res, 409, { ok: false, conflict: true, rev: cur.rev || 0, updatedAt: cur.updatedAt });
+          return;
+        }
         hourlyBackup(cur);
         const next = {
           keys: incoming.keys || {},

@@ -2645,6 +2645,204 @@ var qrcode = function() {
    Couche données · Auth · Routeur · Composants · Migration
 ═══════════════════════════════════════════════════════════ */
 
+/* ═══════════════════════════════════════════════════════════
+   PPSYNC — SYNCHRONISATION MULTI-POSTES (serveur Railway)
+   Envoi auto après chaque modification (2,5 s) · réception auto
+   au démarrage, au retour sur l'onglet et toutes les 60 s ·
+   indicateur d'état · anti-écrasement + copie de secours.
+   ═══════════════════════════════════════════════════════════ */
+var PPSYNC=(function(){
+  var KEYS=['pilotpro_v2','dbs_overrides_2026','dbs_couts_articles_2026','dbs_deleted_2026','dbs_paiements_2026','dbs_comptes_bancaires','dbs_activity_log','dbs_cmd_photos','dbs_gpao_prod_v2','dbs_grandlivre_2026_v2','dbs_taux_eur'];
+  var isPortal=/(\?|&)(atelier|secours)/.test(location.search);
+  var enabled=(location.protocol==='http:'||location.protocol==='https:')&&!isPortal;
+  var S={ state:enabled?'init':'local', ready:false, dirty:false, conflict:false, applying:false,
+          rev:parseInt(localStorage.getItem('pp_sync_rev')||'0',10)||0, lastOk:0, err:'', timer:null };
+  try{ S.dirty = localStorage.getItem('pp_sync_dirty')==='1'; }catch(e){}
+
+  function snap(){ var o={}; KEYS.forEach(function(k){ var v=localStorage.getItem(k); if(v!=null)o[k]=v; }); return o; }
+  function setDirty(d){ S.dirty=!!d; try{ localStorage.setItem('pp_sync_dirty', d?'1':'0'); }catch(e){} paint(); }
+  function setRev(r){ S.rev=r; try{ localStorage.setItem('pp_sync_rev', String(r)); }catch(e){} }
+  function hasData(){ try{ var p=JSON.parse(localStorage.getItem('pilotpro_v2')||'null'); return !!(p&&((p.orders&&p.orders.length)||(p.clients&&p.clients.length))); }catch(e){ return false; } }
+  function lastActTs(keys){ try{ var a=JSON.parse((keys?keys['dbs_activity_log']:localStorage.getItem('dbs_activity_log'))||'[]'); return a.length?(a[a.length-1].ts||0):0; }catch(e){ return 0; } }
+  function editing(){
+    try{
+      if(document.getElementById('active-modal')) return true;
+      var a=document.activeElement;
+      if(a&&/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)&&(Date.now()-(S.lastKey||0))<15000) return true;
+    }catch(e){}
+    return false;
+  }
+  try{ document.addEventListener('keydown',function(){ S.lastKey=Date.now(); },true); }catch(e){}
+
+  function markDirty(){ if(!enabled||S.applying||!S.ready) return; if(!S.dirty) setDirty(true); else paint(); schedule(); }
+  function schedule(){ if(S.timer) clearTimeout(S.timer); S.timer=setTimeout(function(){ push(); }, 2500); }
+
+  async function push(force){
+    if(!enabled||S.applying) return;
+    if(!S.dirty&&!force) return;
+    try{
+      if(!force){
+        var r=await fetch('/api/state',{cache:'no-store'}); var d=await r.json();
+        var srvRev=d.rev||0, srvHas=d.keys&&Object.keys(d.keys).length>0;
+        if(srvHas && srvRev!==S.rev){ S.conflict=true; S.state='conflict'; paint(); return; }
+      }
+      var _body={keys:snap(),ts:Date.now()}; if(!force) _body.baseRev=S.rev; /* garde serveur anti-écrasement */
+      var p=await fetch('/api/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(_body)});
+      var pd=await p.json();
+      if(pd&&pd.ok){ setRev(pd.rev||(S.rev+1)); setDirty(false); S.conflict=false; S.lastOk=Date.now(); S.err=''; S.state='ok'; }
+      else if(pd&&pd.conflict){ S.conflict=true; S.state='conflict'; }
+      else { S.state='err'; S.err=(pd&&pd.error)||'réponse invalide'; }
+    }catch(e){ S.state='off'; S.err='serveur injoignable'; }
+    paint();
+  }
+
+  function applyServer(keys,srvRev,boot){
+    try{ localStorage.setItem('pp_preseed_backup', JSON.stringify({_date:new Date().toISOString(), keys:snap()})); }catch(e){}
+    S.applying=true;
+    KEYS.forEach(function(k){ try{ if(keys[k]!=null) localStorage.setItem(k,keys[k]); }catch(e){} });
+    S.applying=false;
+    setRev(srvRev); setDirty(false); S.conflict=false; S.lastOk=Date.now(); S.state='ok';
+    try{ sessionStorage.setItem('pp_sync_applied', boot?'boot':'live'); }catch(e){}
+    PPSYNC._reload();
+  }
+
+  async function pull(opts){
+    opts=opts||{};
+    if(!enabled||S.applying) return;
+    try{
+      var r=await fetch('/api/state',{cache:'no-store'}); var d=await r.json();
+      var srvRev=d.rev||0, keys=d.keys||{};
+      var srvHas=Object.keys(keys).length>0;
+      if(!srvHas){
+        /* Serveur vierge : ce poste devient la référence s'il a des données */
+        S.state='ok'; S.lastOk=Date.now();
+        if(hasData()){ setDirty(true); schedule(); }
+        finishBoot(opts); paint(); return;
+      }
+      if(srvRev===S.rev){ S.state=S.dirty?'dirty':'ok'; S.lastOk=Date.now(); if(S.dirty) schedule(); finishBoot(opts); paint(); return; }
+      /* Le serveur a une version différente de la nôtre */
+      if(S.dirty){
+        /* Cas fréquent : notre dernier beacon de fermeture a réussi → le serveur contient
+           déjà exactement nos données. On compare le contenu : s'il est identique,
+           on adopte la révision serveur sans déranger personne. */
+        try{ var mine=snap(); var same=true; var union={};
+          Object.keys(mine).forEach(function(k){union[k]=1;}); Object.keys(keys).forEach(function(k){union[k]=1;});
+          Object.keys(union).forEach(function(k){ if((mine[k]||null)!==(keys[k]||null)) same=false; });
+          if(same){ setRev(srvRev); setDirty(false); S.conflict=false; S.state='ok'; S.lastOk=Date.now(); finishBoot(opts); paint(); return; }
+        }catch(e){}
+        S.conflict=true; S.state='conflict'; finishBoot(opts); paint(); return;
+      }
+      if(S.rev===0 && hasData() && lastActTs(null)>lastActTs(keys)){
+        /* Poste jamais synchronisé mais PLUS récent que le serveur (1re mise en service) : ne pas écraser */
+        S.conflict=true; S.state='conflict'; finishBoot(opts); paint(); return;
+      }
+      if(!opts.boot && editing()){ finishBoot(opts); return; } /* pas pendant une saisie — retentera */
+      applyServer(keys,srvRev,!!opts.boot);
+    }catch(e){ S.state='off'; S.err='serveur injoignable'; finishBoot(opts); paint(); }
+  }
+  function finishBoot(opts){ if(opts&&opts.boot&&!S.ready){ S.ready=true; } }
+
+  /* ── Détection des modifications ──
+     1) écritures de CETTE page (patch localStorage.setItem)  */
+  try{
+    var _origSet=Storage.prototype.setItem;
+    Storage.prototype.setItem=function(k,v){
+      _origSet.apply(this,arguments);
+      try{ if(this===window.localStorage && KEYS.indexOf(k)>=0) markDirty(); }catch(e){}
+    };
+  }catch(e){}
+  /* 2) écritures des modules embarqués (iframes Factures HT, Grand Livre) et des autres onglets */
+  window.addEventListener('storage',function(e){ try{ if(e&&e.key&&KEYS.indexOf(e.key)>=0) markDirty(); }catch(_){}});
+
+  /* ── Indicateur d'état dans la barre latérale ── */
+  function fmtH(ts){ try{ var d=new Date(ts); return ('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2); }catch(e){ return ''; } }
+  var STATES={
+    local:  ['⚪','Fichier local — pas de synchro','#94a3b8'],
+    init:   ['◌','Connexion au serveur…','#94a3b8'],
+    ok:     ['🟢','Synchronisé','#22c55e'],
+    dirty:  ['🟠','Envoi en cours…','#f59e0b'],
+    off:    ['🔴','Hors ligne — données sur ce poste','#ef4444'],
+    err:    ['🔴','Erreur serveur','#ef4444'],
+    conflict:['🟣','Conflit — cliquer pour résoudre','#a855f7']
+  };
+  function stateKey(){ if(S.conflict) return 'conflict'; if(S.state==='ok'&&S.dirty) return 'dirty'; return S.state; }
+  function paint(){
+    try{
+      var el=document.getElementById('pp-sync-ind');
+      if(!el){
+        var side=document.querySelector('aside.side'); if(!side) return;
+        el=document.createElement('div'); el.id='pp-sync-ind';
+        el.style.cssText='margin-top:auto;padding:10px 14px;font-size:11px;color:#cbd5e1;cursor:pointer;border-top:1px solid rgba(255,255,255,.08);display:flex;align-items:center;gap:7px;user-select:none';
+        el.onclick=function(){ PPSYNC.dialog(); };
+        side.appendChild(el);
+        side.style.display='flex'; side.style.flexDirection='column';
+      }
+      var st=STATES[stateKey()]||STATES.init;
+      el.innerHTML='<span style="font-size:12px">'+st[0]+'</span><span style="flex:1;line-height:1.3">'+st[1]+(stateKey()==='ok'&&S.lastOk?' · '+fmtH(S.lastOk):'')+'</span>';
+      el.title='Synchronisation multi-postes — cliquer pour les détails';
+    }catch(e){}
+  }
+
+  function dialog(){
+    if(typeof openModal!=='function'){ return; }
+    var st=STATES[stateKey()];
+    var body='<div style="font-size:13px;line-height:1.9">'
+      +'<div style="display:flex;align-items:center;gap:10px;background:var(--bg);border-radius:10px;padding:10px 14px;margin-bottom:12px">'
+      +'<span style="font-size:22px">'+st[0]+'</span><div><b>'+st[1]+'</b>'
+      +(S.lastOk?'<br><span style="font-size:11px;color:var(--slate)">Dernière synchro réussie : '+new Date(S.lastOk).toLocaleString('fr-FR')+'</span>':'')
+      +(S.err?'<br><span style="font-size:11px;color:#b42318">'+S.err+'</span>':'')+'</div></div>'
+      +(!enabled
+        ?'<div style="background:#fef3c7;border-left:4px solid #d97706;border-radius:8px;padding:10px 14px">⚠ Vous avez ouvert PilotPro comme <b>fichier local</b>. Les photos, utilisateurs et données restent sur ce poste. Pour travailler à plusieurs postes, ouvrez toujours <b>l\u0027adresse Railway</b> (https://…railway.app).</div>'
+        :(S.conflict
+          ?'<div style="background:#f3e8ff;border-left:4px solid #a855f7;border-radius:8px;padding:10px 14px"><b>Conflit détecté :</b> ce poste contient des modifications non envoyées <b>et</b> le serveur a des données différentes (travail fait sur un autre poste ?).<br>Choisissez la référence — une copie de secours est conservée dans les deux cas (sauvegardes horaires du serveur + copie locale).</div>'
+          :'<div style="color:var(--slate);font-size:12px">Chaque modification est envoyée automatiquement au serveur ~2,5 s après l\u0027enregistrement. À l\u0027ouverture et toutes les 60 s, ce poste récupère les nouveautés des autres postes. Ne fermez pas l\u0027onglet dans la seconde qui suit une grosse saisie de photos.</div>'))
+      +'</div>';
+    var foot=(enabled
+      ?(S.conflict
+        ?'<button class="btn" style="border-color:#a855f7;color:#a855f7" onclick="PPSYNC.forcePull()">📥 Prendre le SERVEUR (écrase ce poste)</button>'
+         +'<button class="btn" style="border-color:#b45309;color:#b45309" onclick="PPSYNC.forcePush()">📤 Envoyer CE POSTE (écrase le serveur)</button>'
+        :'<button class="btn pri" onclick="PPSYNC.syncNow()">🔄 Synchroniser maintenant</button>')
+      :'')+'<button class="btn" onclick="closeModal()">Fermer</button>';
+    openModal('🔄 Synchronisation multi-postes', body, foot);
+  }
+  function syncNow(){ if(typeof closeModal==='function')closeModal(); if(S.dirty) push(); else pull({}); if(typeof toast==='function')toast('Synchronisation lancée…','ok'); }
+  function forcePush(){ if(typeof closeModal==='function')closeModal(); S.conflict=false; push(true); if(typeof toast==='function')toast('Envoi des données de ce poste…','ok'); }
+  async function forcePull(){
+    if(typeof closeModal==='function')closeModal();
+    try{ var r=await fetch('/api/state',{cache:'no-store'}); var d=await r.json();
+      if(d&&d.keys&&Object.keys(d.keys).length){ applyServer(d.keys,d.rev||0,false); }
+      else if(typeof toast==='function')toast('Serveur vide — rien à recevoir','err');
+    }catch(e){ if(typeof toast==='function')toast('Serveur injoignable','err'); }
+  }
+
+  /* ── Démarrage & boucles ── */
+  function start(){
+    paint();
+    if(!enabled){ S.ready=true; return; }
+    pull({boot:true});
+    setTimeout(function(){ S.ready=true; },8000); /* filet : ne jamais rester bloqué */
+    setInterval(function(){ if(S.applying) return; if(S.dirty) push(); else pull({}); },60000);
+    window.addEventListener('focus',function(){ if(S.dirty) push(); else pull({}); });
+    window.addEventListener('online',function(){ if(S.dirty) push(); else pull({}); });
+    window.addEventListener('beforeunload',function(){
+      /* dernier recours : envoi synchrone si des modifs n'ont pas encore été envoyées */
+      try{ if(S.dirty&&!S.conflict&&navigator.sendBeacon){ navigator.sendBeacon('/api/state', new Blob([JSON.stringify({keys:snap(),ts:Date.now(),baseRev:S.rev})],{type:'application/json'})); /* le drapeau dirty reste levé : au prochain démarrage, si le beacon a réussi, les données identiques seront reconnues et le drapeau retombera tout seul ; sinon le conflit sera signalé au lieu d'être perdu en silence */ } }catch(e){}
+    });
+    /* toast après application des données serveur */
+    try{ var fl=sessionStorage.getItem('pp_sync_applied');
+      if(fl){ sessionStorage.removeItem('pp_sync_applied');
+        document.addEventListener('DOMContentLoaded',function(){ setTimeout(function(){ if(typeof toast==='function') toast('🔄 Données mises à jour depuis le serveur','ok'); },900); });
+      } }catch(e){}
+  }
+  if(document.readyState!=='loading') setTimeout(start,0);
+  else document.addEventListener('DOMContentLoaded',function(){ setTimeout(start,0); });
+
+  return { markDirty:markDirty, push:push, pull:pull, dialog:dialog, syncNow:syncNow,
+           forcePush:forcePush, forcePull:forcePull, snap:snap, paint:paint,
+           _S:S, _enabled:enabled, _reload:function(){ try{ location.reload(); }catch(e){} } };
+})();
+
+
 /* ───────────────────────────────────────────
    1. COUCHE DE DONNÉES (single source of truth)
 ─────────────────────────────────────────── */
@@ -8064,8 +8262,10 @@ function restoreData(input){
     let data; try{ data=JSON.parse(e.target.result); }catch(err){ toast('Fichier JSON invalide','err'); input.value=''; return; }
     // Format global (nouveau) : restaure tous les modules
     if(data && data.keys && typeof data.keys==='object'){
-      const KEYS=['pilotpro_v2','dbs_overrides_2026','dbs_couts_articles_2026','dbs_deleted_2026','dbs_gpao_prod_v2','dbs_grandlivre_2026_v2','dbs_taux_eur'];
-      const noms={pilotpro_v2:'Données principales',dbs_overrides_2026:'Facturation',dbs_couts_articles_2026:'Coûts/marges',dbs_deleted_2026:'Suppressions',dbs_gpao_prod_v2:'GPAO Production',dbs_grandlivre_2026_v2:'Grand Livre',dbs_taux_eur:'Taux EUR'};
+      /* CORRECTIF : la restauration couvre désormais LES MÊMES 11 modules que la sauvegarde
+         (avant, photos, paiements, comptes bancaires et journal étaient perdus à l'import) */
+      const KEYS=['pilotpro_v2','dbs_overrides_2026','dbs_couts_articles_2026','dbs_deleted_2026','dbs_paiements_2026','dbs_comptes_bancaires','dbs_activity_log','dbs_cmd_photos','dbs_gpao_prod_v2','dbs_grandlivre_2026_v2','dbs_taux_eur'];
+      const noms={pilotpro_v2:'Données principales',dbs_overrides_2026:'Facturation',dbs_couts_articles_2026:'Coûts/marges',dbs_deleted_2026:'Suppressions',dbs_paiements_2026:'Paiements',dbs_comptes_bancaires:'Comptes bancaires',dbs_activity_log:'Journal d\'activité',dbs_cmd_photos:'Photos des commandes',dbs_gpao_prod_v2:'GPAO Production',dbs_grandlivre_2026_v2:'Grand Livre',dbs_taux_eur:'Taux EUR'};
       let restored=0, errors=0; const modsOk=[];
       KEYS.forEach(k=>{ if(data.keys[k]!=null){ try{ if(k!=='dbs_taux_eur') JSON.parse(data.keys[k]); localStorage.setItem(k,data.keys[k]); restored++; modsOk.push(noms[k]||k); }catch(_){ errors++; } } });
       let recs=0; try{ const d=JSON.parse(data.keys.pilotpro_v2||'{}'); ['orders','clients','chaines','gammes','tissus','fournitures','bls','brs','factures'].forEach(x=>recs+=((d[x]||[]).length)); }catch(_){}
