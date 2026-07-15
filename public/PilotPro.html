@@ -291,6 +291,9 @@ table.tbl tbody tr:last-child td{border-bottom:none}
       <!-- Pipeline workflow -->
       <div class="pipeline" id="pipeline"></div>
 
+      <!-- Production atelier (GPAO) -->
+      <div id="gpao-live"></div>
+
       <!-- IA -->
       <div class="ai-panel" id="cockpit-ai"></div>
 
@@ -3429,6 +3432,9 @@ function renderCockpit(){
 
   /* Nouveaux graphiques mensuels */
   renderMonthlyCharts('cockpit-chart-fint','cockpit-chart-mfac','cockpit-fint-total','cockpit-mfac-total');
+
+  /* Production atelier — alimentée par la passerelle GPAO → ERP */
+  renderGpaoLive();
 }
 
 function renderCockpitAI(){
@@ -5157,6 +5163,135 @@ function pushModeleToGPAO(modele, samSec, ref, client, qte){
     return true;
   }catch(e){ console.error('bridge GPAO',e); return false; }
 }
+
+/* ═══════════ PASSERELLE GPAO → ERP (sens retour) ═══════════
+   Les journées saisies dans le module GPAO alimentent automatiquement :
+   · ds.prodsOuv  → graphique « Production 7 jours » + « État chaînes » du Cockpit, Stats, module Chaînes
+   · ds.gpaoProd  → miroir agrégé par modèle et par date (carte Cockpit, synchronisé entre postes)
+   · tdsByModel   → date de « mise en production » auto dans la Traçabilité (si vide)
+   · o.produit    → avancement des commandes, réparti en cascade par date de livraison
+                    (augmentation seulement : ne réduit JAMAIS une saisie manuelle)
+   Déclencheurs : démarrage, toute écriture GPAO (même page, iframe, autre onglet), réception serveur. */
+function gpaoBridge(){
+ try{
+  if(typeof ds==='undefined'||!ds) return false;
+  var raw=localStorage.getItem('dbs_gpao_prod_v2'); if(!raw) return false;
+  var G=null; try{G=JSON.parse(raw);}catch(e){return false;}
+  if(!G||!Array.isArray(G.journees)||!G.journees.length) return false;
+  var changed=false;
+  var N=function(s){ s=String(s==null?'':s); try{s=s.normalize('NFD').replace(/[\u0300-\u036f]/g,'');}catch(e){} return s.replace(/\s+/g,'').toUpperCase(); };
+
+  /* 1. Chaînes : garantir l'existence côté ERP (correspondance par nom, création si absente) */
+  ds.chaines=ds.chaines||[];
+  var chMap={};
+  (G.chaines||[]).forEach(function(gc){
+    var nm=N(gc.nom); if(!nm) return;
+    var ec=null; for(var i=0;i<ds.chaines.length;i++){ if(N(ds.chaines[i].nom)===nm){ ec=ds.chaines[i]; break; } }
+    if(!ec){ var nid=ds.chaines.reduce(function(m,c){return Math.max(m,+c.id||0);},0)+1;
+      ec={id:nid,nom:gc.nom,resp:'',spec:'',ouv:0,color:'#0ea5e9'}; ds.chaines.push(ec); changed=true; }
+    chMap[gc.id]=ec.id;
+  });
+
+  /* 2. prodsOuv : lignes horaires issues du GPAO (marquées src:'gpao', régénérées à chaque passage) */
+  var mods={}; (G.modeles||[]).forEach(function(m){mods[m.id]=m;});
+  var gen=[];
+  G.journees.forEach(function(j){
+    var chId=chMap[j.chaineId]; if(!chId||!j.date) return;
+    var s=j.sortie||{}; var objH=(+j.objManuel>0&&+j.nbHeures>0)?Math.round(j.objManuel/j.nbHeures):0;
+    Object.keys(s).forEach(function(col){
+      var q=+s[col]||0; if(!q) return;
+      var h=parseInt(String(col).replace(/\D/g,''),10); h=isNaN(h)?1:h; h=Math.min(Math.max(h-1,0),8);
+      gen.push({id:'gp-'+j.id+'-'+col,date:j.date,chId:chId,hour:h,ouv_id:0,qte:q,retouches:0,obj:objH,src:'gpao'});
+    });
+  });
+  ds.prodsOuv=ds.prodsOuv||[];
+  var man=ds.prodsOuv.filter(function(p){return p&&p.src!=='gpao';});
+  var oldG=JSON.stringify(ds.prodsOuv.filter(function(p){return p&&p.src==='gpao';}));
+  if(oldG!==JSON.stringify(gen)){ ds.prodsOuv=man.concat(gen); changed=true; }
+
+  /* 3. Miroir agrégé par modèle + par date */
+  var byModel={},byDate={};
+  G.journees.forEach(function(j){
+    var pcs=0,s=j.sortie||{}; Object.keys(s).forEach(function(k){pcs+=(+s[k]||0);});
+    var m=mods[j.modeleId]||{}; var nom=m.nom||('Modèle #'+j.modeleId);
+    var b=byModel[nom]=byModel[nom]||{pcs:0,ref:m.ref||'',client:m.client||'',qte:+m.qte||0,first:'',last:'',parJour:{}};
+    b.pcs+=pcs;
+    if(j.date){ b.parJour[j.date]=(b.parJour[j.date]||0)+pcs;
+      if(!b.first||j.date<b.first)b.first=j.date; if(!b.last||j.date>b.last)b.last=j.date;
+      byDate[j.date]=(byDate[j.date]||0)+pcs; }
+  });
+  var mirror={byModel:byModel,byDate:byDate,maj:new Date().toISOString()};
+  var noTs=function(x){ try{var c=JSON.parse(JSON.stringify(x));delete c.maj;return JSON.stringify(c);}catch(e){return '';} };
+  if(!ds.gpaoProd||noTs(ds.gpaoProd)!==noTs(mirror)){ ds.gpaoProd=mirror; changed=true; }
+
+  /* 4. Traçabilité : date de mise en production auto (uniquement si vide — non destructif) */
+  ds.tdsByModel=ds.tdsByModel||{};
+  Object.keys(byModel).forEach(function(nom){
+    var b=byModel[nom]; if(!b.pcs||!b.first) return;
+    var t=ds.tdsByModel[nom];
+    if(!t){ t=ds.tdsByModel[nom]={tds1:{date:'',ok:'',note:''},tds2:{date:'',ok:'',note:''},prod:{date:'',note:''},livr:{date:'',qte:0,note:''}}; changed=true; }
+    if(t.prod&&!t.prod.date){ t.prod.date=b.first; if(!t.prod.note)t.prod.note='Auto (GPAO)'; changed=true; }
+  });
+
+  /* 5. Avancement des commandes : cascade par date de livraison, augmentation seulement */
+  var orders=(ds.orders||[]).filter(function(o){return o&&!o.archived&&!o.annule;});
+  Object.keys(byModel).forEach(function(nom){
+    var b=byModel[nom]; if(!b.pcs) return;
+    var gn=N(nom),gr=N(b.ref);
+    var hits=orders.filter(function(o){
+      var om=N(o.modele),orf=N(o.ref_article);
+      return (om&&om===gn)||(gr&&(orf===gr||om===gr))||(orf&&orf===gn)||(gr&&gr.length>=5&&om.indexOf(gr)===0);
+    }).sort(function(a,c){ var da=String(a.date_livraison||''),dc=String(c.date_livraison||'');
+      if(da&&dc&&da!==dc)return da<dc?-1:1; if(da&&!dc)return -1; if(!da&&dc)return 1; return (+a.id||0)-(+c.id||0); });
+    var rest=b.pcs;
+    hits.forEach(function(o){
+      var cap=+o.qte||0; var take=Math.min(rest,cap); rest-=take;
+      if(take>(+o.produit||0)){ o.produit=take; changed=true; }
+    });
+  });
+
+  if(changed){
+    DB.save();
+    try{ if(typeof currentPage!=='undefined'&&currentPage==='cockpit'&&typeof renderCockpit==='function') renderCockpit(); }catch(e){}
+  }
+  return changed;
+ }catch(e){ console.error('gpaoBridge',e); return false; }
+}
+
+/* Carte Cockpit « Production atelier » (lit le miroir — fonctionne sur tous les postes) */
+function renderGpaoLive(){
+  var el=document.getElementById('gpao-live'); if(!el) return;
+  var gp=ds&&ds.gpaoProd; if(!gp||!gp.byModel||!Object.keys(gp.byModel).length){ el.innerHTML=''; return; }
+  var today=todayISO();
+  var pcsToday=+(gp.byDate&&gp.byDate[today])||0;
+  var last=''; Object.keys(gp.byDate||{}).forEach(function(d){ if(!last||d>last)last=d; });
+  var pcs7=0; for(var i=0;i<7;i++){ var d=new Date(); d.setDate(d.getDate()-i); var iso=d.toISOString().slice(0,10); pcs7+=(+(gp.byDate&&gp.byDate[iso])||0); }
+  var rows=Object.keys(gp.byModel).map(function(nom){ var b=gp.byModel[nom]; return {nom:nom,b:b}; })
+    .filter(function(r){return r.b.pcs>0;})
+    .sort(function(a,c){ return String(c.b.last||'').localeCompare(String(a.b.last||'')); }).slice(0,8);
+  el.innerHTML=
+    '<div class="ai-panel" style="margin:14px 0;padding:14px 16px">'
+    +'<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px">'
+    +'<div style="font-weight:700;font-size:13px">🏭 Production atelier <span style="font-weight:400;color:var(--ink-3);font-size:11px">— journées GPAO synchronisées</span></div>'
+    +'<div style="font-size:11px;color:var(--ink-3)">Aujourd\'hui : <b style="color:var(--brand)">'+pcsToday+' pcs</b> · 7 jours : <b>'+pcs7+' pcs</b>'+(last?' · dernière saisie : <b>'+new Date(last+'T00:00:00').toLocaleDateString('fr-FR')+'</b>':'')+'</div></div>'
+    +rows.map(function(r){ var b=r.b; var pct=b.qte>0?Math.min(100,Math.round(b.pcs/b.qte*100)):0;
+      return '<div style="display:flex;align-items:center;gap:10px;margin:5px 0">'
+      +'<div style="flex:0 0 220px;font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"><b>'+_h(r.nom)+'</b>'+(b.client?' <span style="color:var(--ink-3)">· '+_h(b.client)+'</span>':'')+'</div>'
+      +'<div style="flex:1;background:var(--line);border-radius:4px;height:8px;overflow:hidden"><div style="width:'+pct+'%;height:100%;background:'+(pct>=100?'var(--ok-d,#16a34a)':'var(--brand)')+';border-radius:4px"></div></div>'
+      +'<div style="flex:0 0 130px;text-align:right;font-size:11.5px"><b>'+b.pcs.toLocaleString('fr-FR')+'</b>'+(b.qte?' / '+b.qte.toLocaleString('fr-FR')+' <span style="color:var(--ink-3)">('+pct+'%)</span>':'')+'</div></div>';
+    }).join('')
+    +'</div>';
+}
+
+/* Déclencheurs de la passerelle */
+(function(){
+  if(/(\?|&)(atelier|secours)/.test(location.search)) return; /* jamais sur tablette atelier ni en mode secours */
+  var t=null; function later(){ if(t)clearTimeout(t); t=setTimeout(function(){ try{gpaoBridge();}catch(e){} },1200); }
+  try{ var _s=Storage.prototype.setItem; Storage.prototype.setItem=function(k,v){ _s.apply(this,arguments); try{ if(this===window.localStorage&&k==='dbs_gpao_prod_v2') later(); }catch(e){} }; }catch(e){}
+  try{ window.addEventListener('storage',function(e){ try{ if(e&&e.key==='dbs_gpao_prod_v2') later(); }catch(_){}}); }catch(e){}
+  try{ setTimeout(function(){ try{gpaoBridge();}catch(e){} },1500); }catch(e){}
+})();
+
 function _h(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
 /* ═══════════ FUSION DES CLIENTS (doublons d'orthographe) ═══════════ */
@@ -8534,23 +8669,31 @@ function ouvTot(){ if(!CUR||!CUROUV) return; var t=0; (CUR.cols||[]).forEach(fun
 async function rmw(applyFn,detail){
   var ok=false;
   if(SRV){
-    try{
-      var r=await fetch(API,{cache:'no-store'}); var d=await r.json(); var keys=d.keys||{};
-      var S2=null; try{ S2=JSON.parse(keys['dbs_gpao_prod_v2']||'null'); }catch(e){}
-      if(!S2) S2=S;
-      var j2=((S2.journees)||[]).filter(function(x){return x.id===CUR.id;})[0];
-      if(!j2){ alert('Cette journ\u00e9e a \u00e9t\u00e9 supprim\u00e9e au bureau.'); return false; }
-      applyFn(j2);
-      keys['dbs_gpao_prod_v2']=JSON.stringify(S2);
-      try{ var act=[]; try{ act=JSON.parse(keys['dbs_activity_log']||'[]')||[]; }catch(e){ act=[]; }
-        act.push({ts:Date.now(),uid:0,login:'atelier',name:OP,role:'atelier',action:'saisie atelier',detail:detail});
-        if(act.length>3000) act=act.slice(-3000);
-        keys['dbs_activity_log']=JSON.stringify(act);
-      }catch(e){}
-      var p=await fetch(API,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys:keys})});
-      var pd=await p.json(); ok=!!pd.ok;
-      if(ok){ S=S2; CUR=j2; try{ localStorage.setItem('dbs_gpao_prod_v2',keys['dbs_gpao_prod_v2']); }catch(e){} }
-    }catch(e){ ok=false; }
+    /* Lecture fra\u00eeche \u2192 modification \u2192 envoi prot\u00e9g\u00e9 par baseRev.
+       Si un autre poste (bureau ou autre tablette) a enregistr\u00e9 entre-temps, le serveur
+       refuse (409) et on recommence sur l'\u00e9tat le plus r\u00e9cent \u2014 3 tentatives.
+       Aucune saisie n'est perdue, aucun travail d'un autre poste n'est \u00e9cras\u00e9. */
+    for(var att=0; att<3 && !ok; att++){
+      try{
+        var r=await fetch(API,{cache:'no-store'}); var d=await r.json(); var keys=d.keys||{};
+        var S2=null; try{ S2=JSON.parse(keys['dbs_gpao_prod_v2']||'null'); }catch(e){}
+        if(!S2) S2=S;
+        var j2=((S2.journees)||[]).filter(function(x){return x.id===CUR.id;})[0];
+        if(!j2){ alert('Cette journ\u00e9e a \u00e9t\u00e9 supprim\u00e9e au bureau.'); return false; }
+        applyFn(j2);
+        keys['dbs_gpao_prod_v2']=JSON.stringify(S2);
+        try{ var act=[]; try{ act=JSON.parse(keys['dbs_activity_log']||'[]')||[]; }catch(e){ act=[]; }
+          act.push({ts:Date.now(),uid:0,login:'atelier',name:OP,role:'atelier',action:'saisie atelier',detail:detail});
+          if(act.length>3000) act=act.slice(-3000);
+          keys['dbs_activity_log']=JSON.stringify(act);
+        }catch(e){}
+        var p=await fetch(API,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys:keys,ts:Date.now(),baseRev:(d.rev||0)})});
+        var pd=null; try{ pd=await p.json(); }catch(e){ pd=null; }
+        if(pd&&pd.ok){ ok=true; S=S2; CUR=j2; try{ localStorage.setItem('dbs_gpao_prod_v2',keys['dbs_gpao_prod_v2']); }catch(e){} }
+        else if(pd&&pd.conflict){ /* course perdue : on retente sur l'\u00e9tat frais */ }
+        else { break; }
+      }catch(e){ ok=false; break; }
+    }
   } else {
     try{ var S3=null; try{ S3=JSON.parse(localStorage.getItem('dbs_gpao_prod_v2')||'null'); }catch(e){} if(!S3) S3=S;
       var j3=((S3.journees)||[]).filter(function(x){return x.id===CUR.id;})[0];
