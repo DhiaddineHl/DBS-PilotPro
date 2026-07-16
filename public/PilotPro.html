@@ -3,6 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#0f172a">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
 <title>PilotPro · GPAO Confection Textile</title>
 <style>
 /* ═══════════════════════════════════════════════════════════
@@ -192,6 +195,51 @@ table.tbl tbody tr:last-child td{border-bottom:none}
 .cockpit-grid{display:grid;grid-template-columns:2fr 1fr;gap:18px}
 @media(max-width:1100px){.cockpit-grid,.pipeline{grid-template-columns:1fr}.pipeline{grid-template-columns:repeat(2,1fr)}}
 
+/* ═══════════ ADAPTATION MOBILE (téléphone & petite tablette, ≤880px) ═══════════
+   Aucun effet sur PC : tout est confiné dans la media query. */
+.mob-menu{display:none}
+#mob-ovl{display:none}
+@media(max-width:880px){
+  /* Grille : la barre latérale sort du flux, la page prend toute la largeur */
+  #app{grid-template-columns:1fr;grid-template-areas:"top" "main"}
+  .side{position:fixed;left:0;top:0;bottom:0;width:min(82vw,300px);z-index:1200;
+        transform:translateX(-105%);transition:transform .22s ease;box-shadow:6px 0 28px rgba(0,0,0,.4)}
+  body.side-open .side{transform:translateX(0)}
+  #mob-ovl{position:fixed;inset:0;background:rgba(15,23,42,.55);z-index:1150}
+  body.side-open #mob-ovl{display:block}
+  /* Bouton menu ☰ dans la barre du haut */
+  .mob-menu{display:inline-flex;align-items:center;justify-content:center;width:42px;height:42px;
+            flex:0 0 auto;border:1px solid var(--line);border-radius:10px;background:var(--card);
+            font-size:20px;cursor:pointer;color:var(--ink)}
+  .top{padding:0 10px;gap:10px}
+  .top-title{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+  .main{padding:12px 10px 90px}
+  /* Têtes de page & barres d'outils empilables */
+  .page-head{flex-wrap:wrap;gap:10px}
+  .page-head h1{font-size:19px}
+  .page-actions{flex-wrap:wrap;gap:8px}
+  .toolbar{flex-wrap:wrap;gap:8px}
+  .toolbar .fld{min-width:calc(50% - 8px)!important;flex:1 1 auto}
+  /* Grilles empilées */
+  .kpis{grid-template-columns:repeat(2,1fr);gap:10px}
+  .pipeline{grid-template-columns:repeat(2,1fr)}
+  .cockpit-grid,.form-grid{grid-template-columns:1fr}
+  /* Tableaux : défilement horizontal au doigt, colonnes lisibles */
+  .page table{display:block;overflow-x:auto;-webkit-overflow-scrolling:touch;max-width:100%}
+  .page table th,.page table td{white-space:nowrap}
+  /* Cibles tactiles confortables ; 16px dans les champs = pas de zoom auto iPhone */
+  .btn{min-height:42px}
+  .side .nav-item,.side a,.side button{min-height:42px}
+  .main input,.main select,.main textarea,.modal input,.modal select,.modal textarea{min-height:42px;font-size:16px}
+  /* Fenêtres modales plein écran, tête fixe, corps défilant */
+  .modal-bg{padding:0;align-items:stretch}
+  .modal{width:100vw!important;max-width:100vw!important;height:100dvh;max-height:100dvh!important;
+         border-radius:0;display:flex;flex-direction:column}
+  .modal-body{flex:1 1 auto;overflow-y:auto}
+  /* Applications embarquées (Grand Livre, Factures HT, GPAO) : hauteur utile */
+  .page iframe{width:100%;min-height:72dvh;border:0}
+}
+
 /* ─── AI INSIGHTS ─── */
 .ai-panel{background:linear-gradient(135deg,#faf5ff,#eff6ff);border:1px solid #ddd6fe;border-radius:var(--r-l);padding:16px 18px;margin-bottom:20px}
 .ai-title{font-size:11px;font-weight:700;color:var(--purple);text-transform:uppercase;letter-spacing:.6px;margin-bottom:10px;display:flex;align-items:center;gap:7px}
@@ -262,6 +310,7 @@ table.tbl tbody tr:last-child td{border-bottom:none}
 
   <!-- TOPBAR -->
   <header class="top">
+      <button class="mob-menu" onclick="mobSide(true)" title="Menu" aria-label="Menu">☰</button>
     <div class="top-title" id="top-title">Cockpit<small id="top-sub">Vue d'ensemble</small></div>
     <div class="top-search">
       <span class="si">🔍</span>
@@ -339,6 +388,7 @@ table.tbl tbody tr:last-child td{border-bottom:none}
 
 <div class="toast" id="toast"></div>
 <div id="tv-mount"></div>
+<div id="mob-ovl" onclick="mobSide(false)"></div>
 <div id="modals-mount"></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
@@ -2680,6 +2730,55 @@ var PPSYNC=(function(){
   function markDirty(){ if(!enabled||S.applying||!S.ready) return; if(!S.dirty) setDirty(true); else paint(); schedule(); }
   function schedule(){ if(S.timer) clearTimeout(S.timer); S.timer=setTimeout(function(){ push(); }, 2500); }
 
+  /* ── Fusion automatique multi-utilisateurs ──
+     Chaque poste garde l'empreinte (hachage) du dernier état serveur connu (pp_sync_base).
+     En cas de course entre deux postes, on compare clé par clé : si les modifications
+     locales et celles du serveur portent sur des clés DIFFÉRENTES (ex. Yomna → GPAO
+     pendant que Raouia → Grand Livre), elles sont fusionnées et envoyées automatiquement.
+     Le dialogue de conflit n'apparaît que si la MÊME clé a changé des deux côtés. */
+  function h32(s){ s=String(s==null?'':s); var h=2166136261>>>0; for(var i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=Math.imul(h,16777619)>>>0; } return h.toString(36)+':'+s.length; }
+  function getBase(){ try{ return JSON.parse(localStorage.getItem('pp_sync_base')||'null')||null; }catch(e){ return null; } }
+  function setBase(keys){ try{ var b={}; KEYS.forEach(function(k){ var v=(keys&&keys[k]!=null)?keys[k]:localStorage.getItem(k); b[k]=h32(v); }); localStorage.setItem('pp_sync_base',JSON.stringify(b)); }catch(e){} }
+  function computeMerge(serverKeys){
+    var base=getBase(); if(!base) return null;
+    var mine=snap(); var merged={}, conflicts=[], applyLocal=[];
+    KEYS.forEach(function(k){
+      var l=(mine[k]!=null)?mine[k]:null, s=(serverKeys[k]!=null)?serverKeys[k]:null;
+      if(l===s){ merged[k]=l; return; }
+      var lch=(h32(l)!==base[k]), sch=(h32(s)!==base[k]);
+      if(lch&&sch){ conflicts.push(k); merged[k]=l; return; }
+      if(lch){ merged[k]=l; }
+      else { merged[k]=s; applyLocal.push(k); }
+    });
+    return {merged:merged, conflicts:conflicts, applyLocal:applyLocal};
+  }
+  async function tryAutoMerge(serverKeys, srvRev){
+    for(var att=0; att<3; att++){
+      var cm=computeMerge(serverKeys);
+      if(!cm||cm.conflicts.length) return false;
+      try{
+        var p=await fetch('/api/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys:cm.merged,ts:Date.now(),baseRev:srvRev})});
+        var pd=await p.json();
+        if(pd&&pd.ok){
+          S.applying=true;
+          cm.applyLocal.forEach(function(k){ try{ if(cm.merged[k]!=null) localStorage.setItem(k,cm.merged[k]); }catch(e){} });
+          S.applying=false;
+          setRev(pd.rev||(srvRev+1)); setDirty(false); S.conflict=false; S.lastOk=Date.now(); S.err=''; S.state='ok';
+          setBase(cm.merged);
+          if(cm.applyLocal.length){ try{ sessionStorage.setItem('pp_sync_applied','merge'); }catch(e){} PPSYNC._reload(); }
+          else paint();
+          return true;
+        }
+        if(pd&&pd.conflict){ /* encore une course : relire et retenter */
+          var r=await fetch('/api/state',{cache:'no-store'}); var d=await r.json();
+          serverKeys=d.keys||{}; srvRev=d.rev||0; continue;
+        }
+        return false;
+      }catch(e){ return false; }
+    }
+    return false;
+  }
+
   async function push(force){
     if(!enabled||S.applying) return;
     if(!S.dirty&&!force) return;
@@ -2687,13 +2786,23 @@ var PPSYNC=(function(){
       if(!force){
         var r=await fetch('/api/state',{cache:'no-store'}); var d=await r.json();
         var srvRev=d.rev||0, srvHas=d.keys&&Object.keys(d.keys).length>0;
-        if(srvHas && srvRev!==S.rev){ S.conflict=true; S.state='conflict'; paint(); return; }
+        if(srvHas && srvRev!==S.rev){
+          if(editing()){ schedule(); return; } /* pas pendant une saisie — on retentera */
+          if(await tryAutoMerge(d.keys||{}, srvRev)) return;
+          S.conflict=true; S.state='conflict'; paint(); return;
+        }
       }
       var _body={keys:snap(),ts:Date.now()}; if(!force) _body.baseRev=S.rev; /* garde serveur anti-écrasement */
       var p=await fetch('/api/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(_body)});
       var pd=await p.json();
-      if(pd&&pd.ok){ setRev(pd.rev||(S.rev+1)); setDirty(false); S.conflict=false; S.lastOk=Date.now(); S.err=''; S.state='ok'; }
-      else if(pd&&pd.conflict){ S.conflict=true; S.state='conflict'; }
+      if(pd&&pd.ok){ setRev(pd.rev||(S.rev+1)); setDirty(false); S.conflict=false; S.lastOk=Date.now(); S.err=''; S.state='ok'; setBase(_body.keys); }
+      else if(pd&&pd.conflict){
+        if(!editing()){
+          try{ var r3=await fetch('/api/state',{cache:'no-store'}); var d3=await r3.json();
+            if(await tryAutoMerge(d3.keys||{}, d3.rev||0)) { paint(); return; } }catch(e){}
+        } else { schedule(); return; }
+        S.conflict=true; S.state='conflict';
+      }
       else { S.state='err'; S.err=(pd&&pd.error)||'réponse invalide'; }
     }catch(e){ S.state='off'; S.err='serveur injoignable'; }
     paint();
@@ -2705,6 +2814,7 @@ var PPSYNC=(function(){
     KEYS.forEach(function(k){ try{ if(keys[k]!=null) localStorage.setItem(k,keys[k]); }catch(e){} });
     S.applying=false;
     setRev(srvRev); setDirty(false); S.conflict=false; S.lastOk=Date.now(); S.state='ok';
+    setBase(null); /* empreinte de fusion = état fraîchement appliqué */
     try{ sessionStorage.setItem('pp_sync_applied', boot?'boot':'live'); }catch(e){}
     PPSYNC._reload();
   }
@@ -2722,7 +2832,7 @@ var PPSYNC=(function(){
         if(hasData()){ setDirty(true); schedule(); }
         finishBoot(opts); paint(); return;
       }
-      if(srvRev===S.rev){ S.state=S.dirty?'dirty':'ok'; S.lastOk=Date.now(); if(S.dirty) schedule(); finishBoot(opts); paint(); return; }
+      if(srvRev===S.rev){ S.state=S.dirty?'dirty':'ok'; S.lastOk=Date.now(); if(!S.dirty&&!getBase()) setBase(null); /* amorce l'empreinte de fusion */ if(S.dirty) schedule(); finishBoot(opts); paint(); return; }
       /* Le serveur a une version différente de la nôtre */
       if(S.dirty){
         /* Cas fréquent : notre dernier beacon de fermeture a réussi → le serveur contient
@@ -2731,8 +2841,11 @@ var PPSYNC=(function(){
         try{ var mine=snap(); var same=true; var union={};
           Object.keys(mine).forEach(function(k){union[k]=1;}); Object.keys(keys).forEach(function(k){union[k]=1;});
           Object.keys(union).forEach(function(k){ if((mine[k]||null)!==(keys[k]||null)) same=false; });
-          if(same){ setRev(srvRev); setDirty(false); S.conflict=false; S.state='ok'; S.lastOk=Date.now(); finishBoot(opts); paint(); return; }
+          if(same){ setRev(srvRev); setDirty(false); S.conflict=false; S.state='ok'; S.lastOk=Date.now(); setBase(keys); finishBoot(opts); paint(); return; }
         }catch(e){}
+        if(opts.boot||!editing()){
+          if(await tryAutoMerge(keys, srvRev)){ finishBoot(opts); return; }
+        } else { finishBoot(opts); return; } /* saisie en cours : on retentera au prochain passage */
         S.conflict=true; S.state='conflict'; finishBoot(opts); paint(); return;
       }
       if(S.rev===0 && hasData() && lastActTs(null)>lastActTs(keys)){
@@ -3191,9 +3304,11 @@ const PAGE_TITLES = {};
 NAV_STRUCTURE.forEach(g=>g.items.forEach(i=>PAGE_TITLES[i.id]={t:i.label,ico:i.ico}));
 
 let currentPage = 'cockpit';
+function mobSide(open){ try{ document.body.classList[open?'add':'remove']('side-open'); }catch(e){} }
 function nav(id){
   if(!canAccess(id)){ toast('Accès non autorisé pour votre rôle','err'); if(id!=='cockpit'&&canAccess('cockpit'))nav('cockpit'); return; }
   currentPage = id;
+  mobSide(false); /* mobile : referme le menu au changement de page */
   if(CURRENT_USER && LAST_NAV!==id){ LAST_NAV=id; logAct('navigation',(PAGE_TITLES[id]&&PAGE_TITLES[id].t)||id); }
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('on'));
   document.querySelectorAll('.nav-i').forEach(n=>n.classList.remove('on'));
