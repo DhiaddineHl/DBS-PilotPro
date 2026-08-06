@@ -2745,7 +2745,7 @@ var PPSYNC=(function(){
      Le dialogue de conflit n'apparaît que si la MÊME clé a changé des deux côtés. */
   function h32(s){ s=String(s==null?'':s); var h=2166136261>>>0; for(var i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=Math.imul(h,16777619)>>>0; } return h.toString(36)+':'+s.length; }
   function getBase(){ try{ return JSON.parse(localStorage.getItem('pp_sync_base')||'null')||null; }catch(e){ return null; } }
-  function setBase(keys){ try{ var b={}; KEYS.forEach(function(k){ var v=(keys&&keys[k]!=null)?keys[k]:localStorage.getItem(k); b[k]=h32(v); }); localStorage.setItem('pp_sync_base',JSON.stringify(b)); }catch(e){} }
+  function setBase(keys){ try{ var b={}; KEYS.forEach(function(k){ b[k]=(keys&&keys[k]!=null)?keys[k]:localStorage.getItem(k); }); localStorage.setItem('pp_sync_base',JSON.stringify(b)); }catch(e){} }
   /* Facturation HT / Grand Livre / GPAO Production écrivent dans localStorage depuis leur
      propre cadre (iframe) : ces écritures ne passent pas par markDirty() (chaque cadre a
      son propre environnement JavaScript, indépendant de celui de la page principale).
@@ -2757,8 +2757,82 @@ var PPSYNC=(function(){
     if(!base) return;
     for(var i=0;i<KEYS.length;i++){
       var k=KEYS[i];
-      if(h32(localStorage.getItem(k))!==base[k]){ markDirty(); return; }
+      if(localStorage.getItem(k)!==base[k]){ markDirty(); return; }
     }
+  }
+  /* ═══ Moteur de fusion fiche par fiche (commande par commande, compte par compte...)
+     au lieu de comparer chaque grosse clé comme un seul bloc de texte. Ne signale un
+     vrai conflit QUE si la MÊME fiche a été modifiée différemment des deux côtés.
+     Repli automatique et sûr sur l'ancienne comparaison globale en cas de doute
+     (JSON invalide, structure inattendue) — jamais de fusion "à l'aveugle". ═══ */
+  function _looksLikeRecordArray(arr){
+    return Array.isArray(arr) && (arr.length===0 || arr.every(function(x){ return x&&typeof x==='object'&&!Array.isArray(x)&&x.id!=null; }));
+  }
+  function _looksLikePrimitiveArray(arr){
+    return Array.isArray(arr) && arr.every(function(x){ return x==null || typeof x!=='object'; });
+  }
+  function _isCounterKey(key){ return /^next[A-Z]/.test(key); }
+  function _mergeRecordArrays(baseArr, mineArr, srvArr){
+    function toMap(arr){ var m={}; (arr||[]).forEach(function(r){ if(r&&r.id!=null) m[String(r.id)]=r; }); return m; }
+    var baseMap=toMap(baseArr), mineMap=toMap(mineArr), srvMap=toMap(srvArr);
+    var ids={};
+    Object.keys(baseMap).forEach(function(k){ids[k]=1;});
+    Object.keys(mineMap).forEach(function(k){ids[k]=1;});
+    Object.keys(srvMap).forEach(function(k){ids[k]=1;});
+    var merged=[], conflictIds=[];
+    Object.keys(ids).forEach(function(id){
+      var b=baseMap[id], m=mineMap[id], s=srvMap[id];
+      var mStr=m?JSON.stringify(m):null, sStr=s?JSON.stringify(s):null, bStr=b?JSON.stringify(b):null;
+      if(mStr===sStr){ if(m) merged.push(m); return; }
+      var mChanged=(mStr!==bStr), sChanged=(sStr!==bStr);
+      if(mChanged&&sChanged){ conflictIds.push(id); if(m) merged.push(m); return; }
+      if(mChanged){ if(m) merged.push(m); return; }
+      if(s) merged.push(s);
+    });
+    merged.sort(function(a,b){ var ai=a.id,bi=b.id; return ai>bi?1:(ai<bi?-1:0); });
+    return {merged:merged, conflictIds:conflictIds};
+  }
+  function _mergeValue(key, baseVal, mineVal, srvVal){
+    var mStr=JSON.stringify(mineVal), sStr=JSON.stringify(srvVal), bStr=JSON.stringify(baseVal);
+    if(mStr===sStr) return {value:mineVal, hasConflict:false};
+    if(_isCounterKey(key) && typeof mineVal==='number' && typeof srvVal==='number'){
+      return {value:Math.max(mineVal||0, srvVal||0), hasConflict:false};
+    }
+    if(_looksLikeRecordArray(mineVal)&&_looksLikeRecordArray(srvVal)&&_looksLikeRecordArray(baseVal)){
+      var r=_mergeRecordArrays(baseVal, mineVal, srvVal);
+      return {value:r.merged, hasConflict:r.conflictIds.length>0};
+    }
+    if(_looksLikePrimitiveArray(mineVal)&&_looksLikePrimitiveArray(srvVal)){
+      var set={}; (mineVal||[]).concat(srvVal||[]).forEach(function(v){ set[JSON.stringify(v)]=v; });
+      return {value:Object.keys(set).map(function(k){return set[k];}), hasConflict:false};
+    }
+    if(mineVal&&srvVal&&typeof mineVal==='object'&&typeof srvVal==='object'&&!Array.isArray(mineVal)&&!Array.isArray(srvVal)){
+      var out={}, anyConflict=false, allKeys={};
+      Object.keys(baseVal||{}).forEach(function(k){allKeys[k]=1;});
+      Object.keys(mineVal).forEach(function(k){allKeys[k]=1;});
+      Object.keys(srvVal).forEach(function(k){allKeys[k]=1;});
+      Object.keys(allKeys).forEach(function(k){
+        var sub=_mergeValue(k, (baseVal||{})[k], mineVal[k], srvVal[k]);
+        out[k]=sub.value; if(sub.hasConflict) anyConflict=true;
+      });
+      return {value:out, hasConflict:anyConflict};
+    }
+    var mChanged=(mStr!==bStr), sChanged=(sStr!==bStr);
+    if(mChanged&&sChanged) return {value:mineVal, hasConflict:true};
+    if(mChanged) return {value:mineVal, hasConflict:false};
+    return {value:srvVal, hasConflict:false};
+  }
+  function _mergeJSONDeep(baseObj, mineObj, srvObj){
+    var out={}, anyConflict=false;
+    var allKeys={};
+    Object.keys(baseObj||{}).forEach(function(k){allKeys[k]=1;});
+    Object.keys(mineObj||{}).forEach(function(k){allKeys[k]=1;});
+    Object.keys(srvObj||{}).forEach(function(k){allKeys[k]=1;});
+    Object.keys(allKeys).forEach(function(k){
+      var r=_mergeValue(k, (baseObj||{})[k], (mineObj||{})[k], (srvObj||{})[k]);
+      out[k]=r.value; if(r.hasConflict) anyConflict=true;
+    });
+    return {merged:out, hasConflict:anyConflict};
   }
   function computeMerge(serverKeys){
     var base=getBase(); if(!base) return null;
@@ -2766,7 +2840,23 @@ var PPSYNC=(function(){
     KEYS.forEach(function(k){
       var l=(mine[k]!=null)?mine[k]:null, s=(serverKeys[k]!=null)?serverKeys[k]:null;
       if(l===s){ merged[k]=l; return; }
-      var lch=(h32(l)!==base[k]), sch=(h32(s)!==base[k]);
+      var b=base[k];
+      /* Tentative de fusion fine (fiche par fiche) si les trois versions sont du JSON
+         exploitable ; en cas d'échec (donnée non-JSON, format inattendu), on retombe
+         automatiquement sur l'ancienne comparaison globale ci-dessous — comportement
+         identique à aujourd'hui, jamais moins sûr. */
+      try{
+        var bO=(b==null)?null:JSON.parse(b), lO=(l==null)?null:JSON.parse(l), sO=(s==null)?null:JSON.parse(s);
+        if(bO&&typeof bO==='object'&&!Array.isArray(bO) && lO&&typeof lO==='object'&&!Array.isArray(lO) && sO&&typeof sO==='object'&&!Array.isArray(sO)){
+          var dm=_mergeJSONDeep(bO,lO,sO);
+          if(dm.hasConflict){ conflicts.push(k); merged[k]=l; return; }
+          var mergedStr=JSON.stringify(dm.merged);
+          merged[k]=mergedStr;
+          if(mergedStr!==l) applyLocal.push(k);
+          return;
+        }
+      }catch(e){ /* JSON invalide -> repli ci-dessous */ }
+      var lch=(h32(l)!==h32(b)), sch=(h32(s)!==h32(b));
       if(lch&&sch){ conflicts.push(k); merged[k]=l; return; }
       if(lch){ merged[k]=l; }
       else { merged[k]=s; applyLocal.push(k); }
@@ -2920,9 +3010,13 @@ var PPSYNC=(function(){
     }catch(e){}
   }
 
+  function isAdminUser(){
+    try{ return !!(typeof CURRENT_USER!=='undefined' && CURRENT_USER && CURRENT_USER.role==='admin'); }catch(e){ return false; }
+  }
   function dialog(){
     if(typeof openModal!=='function'){ return; }
     var st=STATES[stateKey()];
+    var admin=isAdminUser();
     var body='<div style="font-size:13px;line-height:1.9">'
       +'<div style="display:flex;align-items:center;gap:10px;background:var(--bg);border-radius:10px;padding:10px 14px;margin-bottom:12px">'
       +'<span style="font-size:22px">'+st[0]+'</span><div><b>'+st[1]+'</b>'
@@ -2931,20 +3025,46 @@ var PPSYNC=(function(){
       +(!enabled
         ?'<div style="background:#fef3c7;border-left:4px solid #d97706;border-radius:8px;padding:10px 14px">⚠ Vous avez ouvert PilotPro comme <b>fichier local</b>. Les photos, utilisateurs et données restent sur ce poste. Pour travailler à plusieurs postes, ouvrez toujours <b>l\u0027adresse Railway</b> (https://…railway.app).</div>'
         :(S.conflict
-          ?'<div style="background:#f3e8ff;border-left:4px solid #a855f7;border-radius:8px;padding:10px 14px"><b>Conflit détecté :</b> ce poste contient des modifications non envoyées <b>et</b> le serveur a des données différentes (travail fait sur un autre poste ?).<br>Choisissez la référence — une copie de secours est conservée dans les deux cas (sauvegardes horaires du serveur + copie locale).</div>'
+          ?'<div style="background:#f3e8ff;border-left:4px solid #a855f7;border-radius:8px;padding:10px 14px"><b>Conflit détecté :</b> ce poste contient des modifications non envoyées <b>et</b> le serveur a des données différentes (travail fait sur un autre poste ?).<br>'
+            +(admin
+              ?'Choisissez la référence — une copie de secours est conservée dans les deux cas (sauvegardes horaires du serveur + copie locale).'
+              :'Seul un <b>administrateur</b> peut choisir d\u0027écraser le serveur avec ce poste. Vous pouvez prendre la version du serveur (vos modifications non envoyées ici seront perdues), ou contacter un administrateur si elles sont importantes.')
+            +'</div>'
           :'<div style="color:var(--slate);font-size:12px">Chaque modification est envoyée automatiquement au serveur ~2,5 s après l\u0027enregistrement. À l\u0027ouverture et toutes les 60 s, ce poste récupère les nouveautés des autres postes. Ne fermez pas l\u0027onglet dans la seconde qui suit une grosse saisie de photos.</div>'))
       +'</div>';
     var foot=(enabled
       ?(S.conflict
         ?'<button class="btn" style="border-color:#a855f7;color:#a855f7" onclick="PPSYNC.forcePull()">📥 Prendre le SERVEUR (écrase ce poste)</button>'
-         +'<button class="btn" style="border-color:#b45309;color:#b45309" onclick="PPSYNC.forcePush()">📤 Envoyer CE POSTE (écrase le serveur)</button>'
+         +(admin?'<button class="btn" style="border-color:#b45309;color:#b45309" onclick="PPSYNC.forcePush()">📤 Envoyer CE POSTE (écrase le serveur)</button>':'')
         :'<button class="btn pri" onclick="PPSYNC.syncNow()">🔄 Synchroniser maintenant</button>')
       :'')+'<button class="btn" onclick="closeModal()">Fermer</button>';
     openModal('🔄 Synchronisation multi-postes', body, foot);
   }
   function syncNow(){ if(typeof closeModal==='function')closeModal(); if(S.dirty) push(); else pull({}); if(typeof toast==='function')toast('Synchronisation lancée…','ok'); }
-  function forcePush(){ if(typeof closeModal==='function')closeModal(); S.conflict=false; push(true); if(typeof toast==='function')toast('Envoi des données de ce poste…','ok'); }
+  function forcePush(){
+    /* Action destructrice pour TOUT LE MONDE : réservée aux administrateurs (double
+       vérification : le bouton n'est déjà visible que pour eux, mais on protège aussi
+       la fonction elle-même). On exige en plus une confirmation explicite, en clair,
+       avant d'écraser ce que d'autres postes ont pu enregistrer entre-temps. */
+    if(!isAdminUser()){
+      if(typeof toast==='function')toast('Seul un administrateur peut écraser le serveur','err');
+      return;
+    }
+    var msg='⚠️ ATTENTION — action irréversible pour tout le monde\n\n'
+      +'Vous allez REMPLACER les données du SERVEUR par celles de CE poste.\n\n'
+      +'Toute modification enregistrée par un AUTRE poste depuis votre dernière '
+      +'synchronisation sera PERDUE (une sauvegarde horaire reste disponible en cas d\'erreur).\n\n'
+      +'Continuer et écraser le serveur ?';
+    if(!confirm(msg)) return;
+    if(typeof closeModal==='function')closeModal();
+    S.conflict=false; push(true);
+    if(typeof toast==='function')toast('Envoi des données de ce poste…','ok');
+  }
   async function forcePull(){
+    /* Moins risqué (n'affecte que CE poste), mais on prévient quand même clairement. */
+    var msg='Vos modifications non envoyées SUR CE POSTE seront remplacées '
+      +'par la version actuelle du serveur.\n\nContinuer ?';
+    if(!confirm(msg)) return;
     if(typeof closeModal==='function')closeModal();
     try{ var r=await fetch('/api/state',{cache:'no-store'}); var d=await r.json();
       if(d&&d.keys&&Object.keys(d.keys).length){ applyServer(d.keys,d.rev||0,false); }
