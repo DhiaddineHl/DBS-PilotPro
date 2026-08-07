@@ -1,16 +1,18 @@
 {
   "name": "pilotpro-serveur",
-  "version": "1.0.0",
-  "description": "PilotPro — Serveur GPAO/ERP pour DBS Fashion (base partagée multi-utilisateurs)",
+  "version": "3.0.0",
+  "description": "PilotPro — Serveur GPAO/ERP pour DBS Fashion (base partagée multi-utilisateurs, stockage PostgreSQL par module ou fichier)",
   "main": "server.js",
   "bin": "server.js",
   "scripts": {
     "start": "node server.js",
+    "migrate": "node migrate-to-postgres.js",
+    "test": "node test-pgwire.js && node test-pgstore.js",
     "build:exe": "pkg . --targets node18-win-x64 --output PilotPro-Serveur.exe"
   },
   "pkg": {
     "assets": [],
-    "scripts": []
+    "scripts": ["pgwire.js", "pgstore.js"]
   },
   "license": "UNLICENSED"
 }

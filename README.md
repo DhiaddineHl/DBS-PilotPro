@@ -83,4 +83,25 @@ L'application garde aussi son bouton « Exporter sauvegarde (JSON) » côté uti
 
 ---
 
-DBS Fashion — PilotPro v2
+## ✨ Nouveau (v3.0) — Base PostgreSQL partagée, par module
+
+Le serveur peut désormais ranger les données dans une **vraie base PostgreSQL, une table par
+module** (`pp_orders`, `pp_clients`, `pp_faconniers`, `pp_grandlivre`, `pp_factures`…), ce qui
+permet de **partager la base avec une autre application** (projet « DBS »).
+
+- **Activation** : définissez la variable d'environnement `DATABASE_URL` (fournie automatiquement
+  par PostgreSQL sur Railway). Sans cette variable, le serveur reste en mode fichier `state.json`
+  (comportement historique, aucun changement).
+- **L'application `PilotPro.html` n'est pas modifiée** : le contrat `/api/state` est identique,
+  la fusion fiche-par-fiche et le mode hors-ligne fonctionnent comme avant.
+- **Fichiers ajoutés** : `pgwire.js` (client PostgreSQL en Node pur, zéro dépendance) et
+  `pgstore.js` (décomposition/recomposition par module).
+- **Import des données existantes** : `DATABASE_URL=... node migrate-to-postgres.js state.json`
+  (vérifie automatiquement, fiche par fiche, qu'aucune donnée n'est perdue).
+- **Lecture pour l'app DBS** : `GET /api/db` (liste des tables) et `GET /api/db/<table>`.
+
+👉 Guide pas-à-pas complet : **`GUIDE_PostgreSQL.md`**.
+
+---
+
+DBS Fashion — PilotPro v3.0
