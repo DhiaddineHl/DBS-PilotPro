@@ -2913,7 +2913,15 @@ var PPSYNC=(function(){
   async function tryAutoMerge(serverKeys, srvRev){
     for(var att=0; att<3; att++){
       var cm=computeMerge(serverKeys);
-      if(!cm||cm.conflicts.length) return false;
+      if(!cm) return false;
+      /* ✨ ZÉRO CONFLIT : quand le même champ a changé des deux côtés, la valeur de
+         CE poste (celle que l'utilisateur vient de saisir) est conservée et la fusion
+         part quand même — plus jamais de dialogue bloquant. L'événement est journalisé,
+         et le journal des prix garde de toute façon l'historique bancaire des prix. */
+      if(cm.conflicts.length){
+        try{ logAct('fusion','résolution automatique — champ(s) disputé(s) sur : '+cm.conflicts.join(', ')+' (valeur de ce poste conservée)'); }catch(e){}
+        try{ if(typeof toast==='function') toast('🔀 Fusion automatique — votre saisie a été conservée','ok'); }catch(e){}
+      }
       try{
         var p=await fetch('/api/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys:cm.merged,ts:Date.now(),baseRev:srvRev})});
         var pd=await p.json();
@@ -2987,8 +2995,15 @@ var PPSYNC=(function(){
     S.applying=false;
     setRev(srvRev); setDirty(false); S.conflict=false; S.lastOk=Date.now(); S.state='ok';
     setBase(null); /* empreinte de fusion = état fraîchement appliqué */
-    try{ sessionStorage.setItem('pp_sync_applied', boot?'boot':'live'); }catch(e){}
-    PPSYNC._reload();
+    /* ✨ FIN DU CLIGNOTEMENT : plus AUCUN rechargement de page. Les données reçues
+       sont appliquées À CHAUD (relecture mémoire + réaffichage de l'écran courant).
+       Avant, chaque application rechargeait la page → reconnexion → nouvelle entrée
+       « connexion » au journal → les autres postes rechargeaient à leur tour →
+       boucle infinie toutes les 3-4 s avec conflits en cascade. */
+    try{
+      if(window.ppSoftRefresh){ window.ppSoftRefresh(boot); paint(); return; }
+    }catch(e){ console.error('[sync] rafraîchissement à chaud',e); }
+    PPSYNC._reload(); /* filet si l'application n'est pas encore prête */
   }
 
   async function pull(opts){
@@ -3542,7 +3557,7 @@ function startApp(){
     const b=document.createElement('button');
     b.id='print-fab'; b.className='fab'; b.title='Imprimer le rapport de ce module';
     b.innerHTML='🖨';
-    b.onclick=printModuleReport;
+    b.onclick=function(){ if(typeof printModuleReport==='function') printModuleReport(); else toast&&toast('Rapport indisponible sur cet écran','err'); };
     b.style.cssText='position:fixed;bottom:22px;right:22px;z-index:90;width:50px;height:50px;border-radius:50%;border:none;background:linear-gradient(135deg,var(--brand),var(--purple));color:#fff;font-size:20px;cursor:pointer;box-shadow:var(--sh-3);transition:transform .15s';
     b.onmouseenter=()=>b.style.transform='translateY(-2px) scale(1.05)';
     b.onmouseleave=()=>b.style.transform='';
@@ -3863,6 +3878,33 @@ function statutTag(o){
 
 /* Registre des modules (rempli par les blocs suivants) */
 const MODULES = {};
+
+/* ═══ RAFRAÎCHISSEMENT À CHAUD (appelé par la synchro, sans recharger la page) ═══ */
+window.ppSoftRefresh=function(boot){
+  try{
+    ds=DB.load();                                   /* relit les données appliquées */
+    try{ loadActivity(); }catch(e){}
+    try{ if(typeof _dtPJ!=='undefined') _dtPJ=null; }catch(e){}   /* cache pièces jointes */
+    try{ refreshRoles(); }catch(e){}
+    if(typeof CURRENT_USER!=='undefined' && CURRENT_USER){
+      /* la session continue — on repointe sur la fiche utilisateur fraîche */
+      var u=(ds.users||[]).find(function(x){return x.id===CURRENT_USER.id;});
+      if(u) CURRENT_USER=u;
+      else { CURRENT_USER=null; try{ sessionStorage.removeItem('pp_user'); }catch(e){} location.reload(); return; }
+      if(!boot){
+        try{ updateBadges(); }catch(e){}
+        try{ buildNav(); }catch(e){}
+        try{
+          var pg=document.getElementById('pg-'+currentPage);
+          if(pg) delete pg.dataset.built;
+          var m=MODULES[currentPage];
+          if(pg&&m){ pg.innerHTML=m.html(); pg.dataset.built='1'; if(m.render) m.render(); }
+        }catch(e){ console.error('[refresh] '+currentPage,e); }
+        try{ toast('🔄 Données mises à jour','ok'); }catch(e){}
+      }
+    }
+  }catch(e){ console.error('[refresh]',e); try{ location.reload(); }catch(_){} }
+};
 </script>
 
 <script>
