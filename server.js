@@ -131,6 +131,52 @@ function makePgStorage(dburl) {
 const usePg = !!DBURL;
 const storage = usePg ? makePgStorage(DBURL) : FileStorage;
 
+/* ════════════════════════════════════════════════════════════════
+   ✨ JOURNAL DES PRIX (modèle bancaire)
+   Chaque changement de prix est une TRANSACTION horodatée, ordonnée
+   par le serveur et jamais effacée : qui, quand, ancien → nouveau.
+   • Mode PostgreSQL : table pp_prix_journal (protégée, jamais purgée)
+   • Mode fichier    : data/prices.jsonl (ajout en fin, jamais réécrit)
+   ════════════════════════════════════════════════════════════════ */
+const PRICES = path.join(DATADIR, 'prices.jsonl');
+const priceStore = {
+  async add(user, txs, ip) {
+    if (usePg) { await storage._store.addPriceTxs(user, txs, ip); return { count: txs.length }; }
+    let seq = Date.now();
+    for (const t of txs) {
+      const entry = { seq: seq++, ts: new Date().toISOString(), user: user || '', orderId: String(t.orderId), of: t.of || '', field: t.field, old: t.old == null ? null : +t.old, nw: t.nw == null ? null : +t.nw, ip: ip || '' };
+      fs.appendFileSync(PRICES, JSON.stringify(entry) + '\n');
+    }
+    return { count: txs.length };
+  },
+  async query(orderId, limit) {
+    if (usePg) return storage._store.queryPrices(orderId, limit);
+    const lim = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500);
+    let lines = [];
+    try { lines = fs.readFileSync(PRICES, 'utf8').split('\n').filter(l => l.trim()); } catch (e) {}
+    let entries = lines.map(l => { try { return JSON.parse(l); } catch (e) { return null; } }).filter(Boolean);
+    if (orderId != null) entries = entries.filter(e => e.orderId === String(orderId));
+    return entries.slice(-lim).reverse();
+  }
+};
+
+/* ════════════════════════════════════════════════════════════════
+   ✨ TEMPS RÉEL (Server-Sent Events, natif, zéro dépendance)
+   Chaque poste garde une connexion ouverte sur /api/events.
+   À chaque enregistrement, le serveur diffuse la nouvelle révision :
+   les autres postes se mettent à jour en ~1 seconde au lieu de 60.
+   Un battement de cœur toutes les 25 s empêche les proxys (Railway…)
+   de couper les connexions inactives.
+   ════════════════════════════════════════════════════════════════ */
+const sseClients = new Set();
+function sseBroadcast(rev) {
+  const payload = 'data: ' + JSON.stringify({ rev }) + '\n\n';
+  for (const c of sseClients) { try { c.write(payload); } catch (e) { sseClients.delete(c); } }
+}
+setInterval(() => {
+  for (const c of sseClients) { try { c.write(': ping\n\n'); } catch (e) { sseClients.delete(c); } }
+}, 25000);
+
 /* ═══ HTTP helpers ═══ */
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css',
@@ -169,6 +215,22 @@ function json(res, code, obj) {
 const server = http.createServer((req, res) => {
   const url = decodeURIComponent(req.url.split('?')[0]);
 
+  /* ───── ✨ Temps réel : flux d'événements (SSE) ───── */
+  if (url === '/api/events' && req.method === 'GET') {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-store',
+      'X-Accel-Buffering': 'no'
+    });
+    res.write('retry: 3000\n\n');            /* reconnexion auto en 3 s si coupure */
+    Promise.resolve(storage.getRev())
+      .then(rev => { try { res.write('data: ' + JSON.stringify({ rev }) + '\n\n'); } catch (e) {} })
+      .catch(() => {});
+    sseClients.add(res);
+    req.on('close', () => sseClients.delete(res));
+    return;
+  }
+
   /* ───── État partagé (GET) — INCHANGÉ ───── */
   if (url === '/api/state' && req.method === 'GET') {
     Promise.resolve(storage.loadState())
@@ -195,8 +257,32 @@ const server = http.createServer((req, res) => {
         const saved = await storage.saveState(incoming.keys || {}, incoming.ts);
         logAudit('state_update', { newRev: saved.rev, itemsBefore, itemsAfter, stateSizeBytes: body.length, backend: usePg ? 'postgres' : 'file', ip: (req.socket && req.socket.remoteAddress) || '' });
         json(res, 200, { ok: true, rev: saved.rev, ts: saved.ts });
+        sseBroadcast(saved.rev);             /* ✨ prévient tous les postes en ~1 s */
       } catch (e) { json(res, 400, { ok: false, error: String(e && e.message || e) }); }
     });
+    return;
+  }
+
+  /* ───── ✨ Journal des prix (modèle bancaire) ───── */
+  if (url === '/api/prices' && req.method === 'POST') {
+    readBody(req, async body => {
+      try {
+        const p = JSON.parse(body || '{}');
+        const txs = Array.isArray(p.txs) ? p.txs.slice(0, 100) : [];
+        const valid = txs.filter(t => t && t.orderId != null && (t.field === 'prix_vente' || t.field === 'prix_facon'));
+        if (!valid.length) { json(res, 400, { ok: false, error: 'aucune transaction valide' }); return; }
+        const r = await priceStore.add(String(p.user || '').slice(0, 60), valid, (req.socket && req.socket.remoteAddress) || '');
+        logAudit('price_tx', { count: r.count, user: String(p.user || '').slice(0, 60), orders: valid.map(t => t.of || t.orderId).slice(0, 10) });
+        json(res, 200, { ok: true, count: r.count });
+      } catch (e) { json(res, 400, { ok: false, error: String(e && e.message || e) }); }
+    });
+    return;
+  }
+  if (url === '/api/prices' && req.method === 'GET') {
+    const q = new URLSearchParams((req.url.split('?')[1] || ''));
+    priceStore.query(q.get('orderId'), q.get('limit'))
+      .then(entries => json(res, 200, { ok: true, count: entries.length, entries }))
+      .catch(e => json(res, 500, { ok: false, error: String(e && e.message || e) }));
     return;
   }
 
@@ -244,6 +330,7 @@ const server = http.createServer((req, res) => {
         const r = await storage.restore(bk, name);
         logAudit('backup_restored', { name, newRev: r.rev });
         json(res, 200, { ok: true, rev: r.rev });
+        sseBroadcast(r.rev);                 /* ✨ les postes rechargent la restauration */
       } catch (e) { json(res, 400, { ok: false, error: String(e && e.message || e) }); }
     });
     return;
@@ -279,7 +366,7 @@ function lanIPs() {
 server.listen(PORT, () => {
   console.log('');
   console.log('  ╔══════════════════════════════════════════════╗');
-  console.log('  ║   PilotPro — Serveur v3.0 DBS Fashion démarré ║');
+  console.log('  ║   PilotPro — Serveur v3.2 DBS Fashion démarré ║');
   console.log('  ╚══════════════════════════════════════════════╝');
   console.log('');
   console.log('  Sur ce PC :        http://localhost:' + PORT);
@@ -290,5 +377,7 @@ server.listen(PORT, () => {
   console.log('  Sauvegardes :      ' + BKDIR + '  (horaires + quotidiennes)');
   console.log('  Audit :            ' + AUDIT + '  (lecture: /api/audit)');
   console.log('  Compression :      gzip activée sur toutes les réponses');
+  console.log('  Temps réel :       /api/events (les postes sont prévenus en ~1 s)');
+  console.log('  Journal des prix : /api/prices  (' + (usePg ? 'table pp_prix_journal' : PRICES) + ')');
   console.log('');
 });

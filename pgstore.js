@@ -121,6 +121,9 @@ function resolveRefs(node, loadTable) {
 /* ════════════════════════════════════════════════════════════════
    Store : initialise le schéma, écrit (POST) et lit (GET) l'état.
    ════════════════════════════════════════════════════════════════ */
+/* Tables système : jamais purgées par saveState, jamais exposées par readTable */
+const RESERVED_TABLES = new Set(['pp_meta', 'pp_prix_journal']);
+
 class PgStore {
   constructor(db) { this.db = db; this.knownTables = new Set(); }
 
@@ -129,6 +132,30 @@ class PgStore {
       k text PRIMARY KEY, v jsonb, updated_at timestamptz DEFAULT now())`);
     await this.db.query(`INSERT INTO pp_meta(k,v) VALUES('__sys.rev','0')
       ON CONFLICT(k) DO NOTHING`);
+    /* ✨ Journal des prix (modèle bancaire) : chaque changement de prix est une
+       transaction horodatée, ordonnée par le serveur, jamais effacée. */
+    await this.db.query(`CREATE TABLE IF NOT EXISTS pp_prix_journal (
+      seq bigserial PRIMARY KEY,
+      ts timestamptz DEFAULT now(),
+      user_name text, order_id text, of_number text, field text,
+      old_value double precision, new_value double precision, ip text)`);
+  }
+
+  /* ─── Journal des prix ─── */
+  async addPriceTxs(user, txs, ip) {
+    for (const t of txs) {
+      await this.db.query(
+        'INSERT INTO pp_prix_journal(user_name,order_id,of_number,field,old_value,new_value,ip) VALUES($1,$2,$3,$4,$5,$6,$7)',
+        [user || '', String(t.orderId), t.of || '', t.field, t.old == null ? null : +t.old, t.nw == null ? null : +t.nw, ip || '']);
+    }
+    return { count: txs.length };
+  }
+  async queryPrices(orderId, limit) {
+    const lim = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500);
+    const r = orderId != null
+      ? await this.db.query('SELECT seq,ts,user_name,order_id,of_number,field,old_value,new_value FROM pp_prix_journal WHERE order_id=$1 ORDER BY seq DESC LIMIT ' + lim, [String(orderId)])
+      : await this.db.query('SELECT seq,ts,user_name,order_id,of_number,field,old_value,new_value FROM pp_prix_journal ORDER BY seq DESC LIMIT ' + lim);
+    return r.rows.map(x => ({ seq: +x.seq, ts: x.ts, user: x.user_name, orderId: x.order_id, of: x.of_number, field: x.field, old: x.old_value == null ? null : +x.old_value, nw: x.new_value == null ? null : +x.new_value }));
   }
 
   async _ensureTable(name) {
@@ -228,10 +255,11 @@ class PgStore {
         }
       }
       // 4) purge des tables de fiches devenues vides (plus référencées)
+      //    — les tables système (journal des prix, meta) ne sont JAMAIS purgées
       const existing = await c.query(
         "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename LIKE 'pp_%' AND tablename<>'pp_meta'");
       for (const row of existing.rows) {
-        if (!seen.has(row.tablename)) await c.query(`DELETE FROM ${row.tablename}`);
+        if (!seen.has(row.tablename) && !RESERVED_TABLES.has(row.tablename)) await c.query(`DELETE FROM ${row.tablename}`);
       }
       return { rev };
     });
@@ -240,11 +268,11 @@ class PgStore {
   /* Liste des tables « module » disponibles pour l'app DBS. */
   async listTables() {
     const r = await this.db.query(
-      "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename LIKE 'pp_%' AND tablename<>'pp_meta' ORDER BY tablename");
+      "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename LIKE 'pp_%' AND tablename<>'pp_meta' AND tablename<>'pp_prix_journal' ORDER BY tablename");
     return r.rows.map(x => x.tablename);
   }
   async readTable(name) {
-    if (!/^pp_[a-z0-9_]+$/.test(name) || name === 'pp_meta') throw new Error('table invalide');
+    if (!/^pp_[a-z0-9_]+$/.test(name) || RESERVED_TABLES.has(name)) throw new Error('table invalide');
     const r = await this.db.query(`SELECT id,data,updated_at FROM ${name} ORDER BY ord`);
     return r.rows.map(x => ({ id: x.id, updated_at: x.updated_at, ...JSON.parse(x.data) }));
   }
