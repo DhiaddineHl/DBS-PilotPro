@@ -169,8 +169,12 @@ const priceStore = {
    de couper les connexions inactives.
    ════════════════════════════════════════════════════════════════ */
 const sseClients = new Set();
-function sseBroadcast(rev) {
-  const payload = 'data: ' + JSON.stringify({ rev }) + '\n\n';
+function sseBroadcast(rev, restore) {
+  /* ✨ restore:1 → il ne s'agit pas d'un enregistrement ordinaire mais de la
+     RESTAURATION d'une sauvegarde : les autres postes doivent adopter cet état
+     tel quel, sans fusionner leurs modifications locales par-dessus (sinon les
+     fiches supprimées par la sauvegarde réapparaissent aussitôt). */
+  const payload = 'data: ' + JSON.stringify(restore ? { rev, restore: 1 } : { rev }) + '\n\n';
   for (const c of sseClients) { try { c.write(payload); } catch (e) { sseClients.delete(c); } }
 }
 setInterval(() => {
@@ -257,7 +261,7 @@ const server = http.createServer((req, res) => {
         const saved = await storage.saveState(incoming.keys || {}, incoming.ts);
         logAudit('state_update', { newRev: saved.rev, itemsBefore, itemsAfter, stateSizeBytes: body.length, backend: usePg ? 'postgres' : 'file', ip: (req.socket && req.socket.remoteAddress) || '' });
         json(res, 200, { ok: true, rev: saved.rev, ts: saved.ts });
-        sseBroadcast(saved.rev);             /* ✨ prévient tous les postes en ~1 s */
+        sseBroadcast(saved.rev, !!incoming.restore); /* ✨ prévient tous les postes en ~1 s */
       } catch (e) { json(res, 400, { ok: false, error: String(e && e.message || e) }); }
     });
     return;
