@@ -181,6 +181,155 @@ setInterval(() => {
   for (const c of sseClients) { try { c.write(': ping\n\n'); } catch (e) { sseClients.delete(c); } }
 }, 25000);
 
+/* ════════════════════════════════════════════════════════════════
+   AUTORITÉ SERVEUR FICHE PAR FICHE (v3.3)
+   ────────────────────────────────────────────────────────────────
+   Principe (celui des vrais ERP) : la base du serveur est l'autorité.
+   Une photo d'état reçue d'un poste est FUSIONNÉE fiche par fiche :
+     · fiche présente des deux côtés  → la plus récente gagne (_ts),
+       à égalité le poste qui écrit gagne (il travaille activement) ;
+     · fiche seulement chez le poste  → ajoutée (création) — sauf si
+       une pierre tombale plus récente indique qu'elle a été supprimée
+       ailleurs (elle ne ressuscite pas) ;
+     · fiche seulement sur le serveur → SAUVÉE, sauf pierre tombale
+       du poste (vraie suppression). Un poste resté éteint des jours
+       ne peut donc plus effacer les commandes ajoutées entre-temps.
+   Les compteurs (nextOfNum…) prennent le MAXIMUM des deux côtés :
+   plus de numéros d'OF réutilisés après une divergence.
+   ════════════════════════════════════════════════════════════════ */
+function _estTableauFiches(v) {
+  return Array.isArray(v) && v.every(x => x && typeof x === 'object' && !Array.isArray(x) && x.id != null);
+}
+function _tombIndex(keysA, keysB) {
+  /* pierres tombales des deux côtés, la plus récente par (champ,id) */
+  const idx = {};
+  [keysA, keysB].forEach(keys => {
+    try {
+      const arr = JSON.parse((keys && keys['dbs_tombstones']) || '[]');
+      if (Array.isArray(arr)) arr.forEach(t => {
+        if (!t || t.id == null || !t.k) return;
+        const kk = t.k + ' ' + t.id;
+        if (!idx[kk] || (t.ts || 0) > idx[kk]) idx[kk] = t.ts || 0;
+      });
+    } catch (e) {}
+  });
+  return idx;
+}
+function _fusionTableau(champ, srvArr, inArr, tombs, detail, horizon) {
+  const parId = {};
+  const ordre = [];
+  let retirees = 0;
+  inArr.forEach(r => {
+    const tomb = tombs[champ + ' ' + r.id] || 0;
+    if (tomb > (r._ts || 0)) { retirees++; return; } /* supprimée ailleurs, plus récemment : ne ressuscite pas */
+    parId[r.id] = r; ordre.push(r.id);
+  });
+  let sauvees = 0; const exemples = [];
+  /* fiches du poste retirées car supprimées plus récemment ailleurs */
+  const idsServeur = {}; srvArr.forEach(s => { idsServeur[s.id] = 1; });
+  if (horizon > 0) {
+    /* fiches connues SEULEMENT du poste et antérieures à la dernière restauration :
+       la restauration a déjà tranché — elles ne reviennent pas toutes seules */
+    ordre.slice().forEach(id => {
+      const r = parId[id];
+      if (r && !idsServeur[id] && (r._ts || 0) < horizon) { delete parId[id]; }
+    });
+  }
+  srvArr.forEach(s => {
+    const kk = champ + ' ' + s.id;
+    if (parId[s.id] != null) {
+      /* présente des deux côtés : la plus récente gagne ; égalité → le poste (actif) */
+      if ((s._ts || 0) > (parId[s.id]._ts || 0)) parId[s.id] = s;
+      return;
+    }
+    if ((tombs[kk] || 0) >= (s._ts || 0) && tombs[kk]) return;   /* vraie suppression du poste */
+    parId[s.id] = s; ordre.push(s.id); sauvees++;
+    if (exemples.length < 5) exemples.push(s.of_number || s.ref || s.nom || s.id);
+  });
+  if (sauvees || retirees) detail.push({ champ, sauvees, retirees, exemples });
+  return ordre.filter(id => parId[id] != null).map(id => parId[id]);
+}
+function mergeAutorite(serverKeys, inKeys) {
+  const out = {};
+  Object.keys(inKeys).forEach(k => { out[k] = inKeys[k]; });
+  /* les clés présentes seulement côté serveur sont conservées telles quelles */
+  Object.keys(serverKeys).forEach(k => { if (out[k] == null) out[k] = serverKeys[k]; });
+  const tombs = _tombIndex(serverKeys, inKeys);
+  const detail = [];
+  let rescued = 0;
+  let horizon = 0;
+  try { horizon = parseInt(serverKeys['pp_restore_horizon'] || '0', 10) || 0; } catch (e) {}
+  if (out['pp_restore_horizon'] == null && serverKeys['pp_restore_horizon'] != null) out['pp_restore_horizon'] = serverKeys['pp_restore_horizon'];
+
+  /* 1 · pilotpro_v2 : fusion de chaque tableau de fiches + compteurs au max */
+  try {
+    const S = JSON.parse(serverKeys['pilotpro_v2'] || 'null');
+    const I = JSON.parse(inKeys['pilotpro_v2'] || 'null');
+    if (S && I && typeof S === 'object' && typeof I === 'object') {
+      const R = I;                                    /* base = photo du poste (scalaires, préférences) */
+      const champs = new Set(Object.keys(S).concat(Object.keys(I)));
+      champs.forEach(ch => {
+        const sv = S[ch], iv = I[ch];
+        if (_estTableauFiches(sv) && _estTableauFiches(iv)) {
+          R[ch] = _fusionTableau(ch, sv, iv, tombs, detail, horizon);
+        } else if (_estTableauFiches(sv) && iv == null) {
+          R[ch] = sv;                                  /* tableau absent de la photo : conservé */
+        } else if (/^next/i.test(ch) && typeof sv === 'number' && typeof iv === 'number') {
+          R[ch] = Math.max(sv, iv);                    /* compteurs : jamais en arrière */
+        }
+      });
+      out['pilotpro_v2'] = JSON.stringify(R);
+    }
+  } catch (e) { /* photo illisible : on garde la photo telle quelle */ }
+
+  /* 2 · tableaux de fiches de premier niveau (journal d'activité, paiements, comptes) */
+  ['dbs_activity_log', 'dbs_paiements_2026', 'dbs_comptes_bancaires'].forEach(k => {
+    try {
+      const sv = JSON.parse(serverKeys[k] || 'null');
+      const iv = JSON.parse(inKeys[k] || 'null');
+      if (_estTableauFiches(sv) && _estTableauFiches(iv)) {
+        let merged = _fusionTableau(k, sv, iv, tombs, detail, horizon);
+        if (k === 'dbs_activity_log' && merged.length > 4000) merged = merged.slice(-4000);
+        out[k] = JSON.stringify(merged);
+      }
+    } catch (e) {}
+  });
+
+  /* 3 · dictionnaires liés aux commandes (photos, pièces jointes, coûts, facturation) :
+         les entrées connues seulement du serveur sont conservées ; celles dont la
+         commande a une pierre tombale sont retirées. Même clé → le poste gagne. */
+  ['dbs_cmd_photos', 'dbs_prepa_pj', 'dbs_overrides_2026', 'dbs_couts_articles_2026'].forEach(k => {
+    try {
+      const sv = JSON.parse(serverKeys[k] || 'null');
+      const iv = JSON.parse(inKeys[k] || 'null');
+      if (sv && iv && typeof sv === 'object' && typeof iv === 'object' && !Array.isArray(sv) && !Array.isArray(iv)) {
+        const R = {};
+        Object.keys(sv).forEach(id => { if (!tombs['orders ' + id]) R[id] = sv[id]; });
+        Object.keys(iv).forEach(id => { R[id] = iv[id]; });
+        out[k] = JSON.stringify(R);
+      }
+    } catch (e) {}
+  });
+
+  /* 4 · fusion des pierres tombales elles-mêmes (union, bornée) */
+  try {
+    const seen = {}; const all = [];
+    [serverKeys, inKeys].forEach(keys => {
+      try { (JSON.parse((keys && keys['dbs_tombstones']) || '[]') || []).forEach(t => {
+        if (!t || t.id == null || !t.k) return;
+        const kk = t.k + ' ' + t.id;
+        if (seen[kk] == null || (t.ts || 0) > all[seen[kk]].ts) { if (seen[kk] == null) { seen[kk] = all.length; all.push(t); } else all[seen[kk]] = t; }
+      }); } catch (e) {}
+    });
+    all.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+    out['dbs_tombstones'] = JSON.stringify(all.slice(-4000));
+  } catch (e) {}
+
+  detail.forEach(d => { rescued += (d.sauvees || 0); });
+  const changed = detail.length > 0;
+  return { keys: out, rescued, changed, detail };
+}
+
 /* ═══ HTTP helpers ═══ */
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css',
@@ -258,9 +407,41 @@ const server = http.createServer((req, res) => {
         }
         const itemsBefore = curRev; // info indicative
         const itemsAfter  = incoming.keys ? Object.keys(incoming.keys).length : 0;
-        const saved = await storage.saveState(incoming.keys || {}, incoming.ts);
-        logAudit('state_update', { newRev: saved.rev, itemsBefore, itemsAfter, stateSizeBytes: body.length, backend: usePg ? 'postgres' : 'file', ip: (req.socket && req.socket.remoteAddress) || '' });
-        json(res, 200, { ok: true, rev: saved.rev, ts: saved.ts });
+        /* ═══ AUTORITÉ SERVEUR FICHE PAR FICHE (v3.3) ═══
+           Le serveur ne remplace plus aveuglément sa base par la photo reçue :
+           il fusionne fiche par fiche. Une commande présente sur le serveur et
+           absente de la photo d'un poste N'EST SUPPRIMÉE que si ce poste l'a
+           réellement supprimée (pierre tombale) — sinon elle est SAUVÉE.
+           Un poste resté éteint ne peut donc plus jamais effacer le travail
+           des autres. Seules exceptions : restauration d'une sauvegarde et
+           « Envoyer CE POSTE » de l'administrateur (remplacement assumé). */
+        let toSave = incoming.keys || {};
+        let rescueInfo = null;
+        if (incoming.restore) {
+          /* HORIZON DE RESTAURATION : une sauvegarde vient d'être imposée. Les photos
+             de postes restés en retard (fiches antérieures à cet instant) ne pourront
+             plus réinjecter ce que la restauration a volontairement retiré. */
+          toSave = Object.assign({}, toSave, { pp_restore_horizon: String(Date.now()) });
+        }
+        if (!incoming.restore && !incoming.force && Object.keys(toSave).length) {
+          try {
+            const cur = await storage.loadState();
+            if (cur && cur.keys && Object.keys(cur.keys).length) {
+              const mg = mergeAutorite(cur.keys, toSave);
+              toSave = mg.keys;
+              if (mg.changed) {
+                rescueInfo = mg;
+                logAudit('rescue', { total: mg.rescued, detail: mg.detail, ip: (req.socket && req.socket.remoteAddress) || '' });
+              }
+            }
+          } catch (e) { logAudit('merge_error', { error: String(e && e.message || e) }); }
+        }
+        const saved = await storage.saveState(toSave, incoming.ts);
+        logAudit('state_update', { newRev: saved.rev, itemsBefore, itemsAfter, rescued: rescueInfo ? rescueInfo.rescued : 0, stateSizeBytes: body.length, backend: usePg ? 'postgres' : 'file', ip: (req.socket && req.socket.remoteAddress) || '' });
+        /* Des fiches ont été sauvées → l'état serveur diffère de la photo envoyée :
+           on renvoie l'état FUSIONNÉ pour que le poste s'aligne immédiatement. */
+        if (rescueInfo) json(res, 200, { ok: true, rev: saved.rev, ts: saved.ts, rescued: rescueInfo.rescued, keys: toSave });
+        else json(res, 200, { ok: true, rev: saved.rev, ts: saved.ts });
         sseBroadcast(saved.rev, !!incoming.restore); /* ✨ prévient tous les postes en ~1 s */
       } catch (e) { json(res, 400, { ok: false, error: String(e && e.message || e) }); }
     });

@@ -2709,7 +2709,7 @@ var qrcode = function() {
    indicateur d'état · anti-écrasement + copie de secours.
    ═══════════════════════════════════════════════════════════ */
 var PPSYNC=(function(){
-  var KEYS=['pilotpro_v2','dbs_overrides_2026','dbs_couts_articles_2026','dbs_deleted_2026','dbs_paiements_2026','dbs_comptes_bancaires','dbs_activity_log','dbs_cmd_photos','dbs_prepa_pj','dbs_gpao_prod_v2','dbs_grandlivre_2026_v2','dbs_taux_eur'];
+  var KEYS=['pilotpro_v2','dbs_overrides_2026','dbs_couts_articles_2026','dbs_deleted_2026','dbs_paiements_2026','dbs_comptes_bancaires','dbs_activity_log','dbs_cmd_photos','dbs_prepa_pj','dbs_gpao_prod_v2','dbs_grandlivre_2026_v2','dbs_taux_eur','dbs_tombstones'];
   var isPortal=/(\?|&)(atelier|secours)/.test(location.search);
   var enabled=(location.protocol==='http:'||location.protocol==='https:')&&!isPortal;
   var S={ state:enabled?'init':'local', ready:false, dirty:false, conflict:false, applying:false,
@@ -2841,6 +2841,11 @@ var PPSYNC=(function(){
   function _mergeValue(key, baseVal, mineVal, srvVal){
     var mStr=JSON.stringify(mineVal), sStr=JSON.stringify(srvVal), bStr=JSON.stringify(baseVal);
     if(mStr===sStr) return {value:mineVal, hasConflict:false};
+    /* ✨ _ts (horodatage de fiche) : JAMAIS un conflit — on garde le plus récent.
+       Sans cette règle, deux métiers modifiant la MÊME commande en même temps
+       (magasin + modéliste) entreraient en conflit sur l'horodatage lui-même
+       et la fusion champ par champ serait abandonnée. */
+    if(key==='_ts'){ return {value:(Math.max(+mineVal||0, +srvVal||0)||mineVal||srvVal), hasConflict:false}; }
     if(_isCounterKey(key) && typeof mineVal==='number' && typeof srvVal==='number'){
       return {value:Math.max(mineVal||0, srvVal||0), hasConflict:false};
     }
@@ -2931,7 +2936,23 @@ var PPSYNC=(function(){
   async function tryAutoMerge(serverKeys, srvRev){
     for(var att=0; att<3; att++){
       var cm=computeMerge(serverKeys);
-      if(!cm) return false;
+      if(!cm){
+        /* ✨ Pas d'empreinte de fusion (stockage plein, poste ancien…) : avant, on
+           levait un CONFLIT bloquant — et le choix manuel pouvait écraser le travail
+           des autres. Désormais on envoie notre photo TELLE QUELLE : le serveur
+           arbitre fiche par fiche et rien ne peut se perdre. */
+        try{
+          var pf=await fetch('/api/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys:snap(),ts:Date.now(),baseRev:srvRev})});
+          var pfd=await pf.json();
+          if(pfd&&pfd.ok){
+            setRev(pfd.rev||(srvRev+1)); setDirty(false); S.conflict=false; S.lastOk=Date.now(); S.err=''; S.state='ok';
+            if(pfd.rescued&&pfd.keys){ _adopterFusion(pfd); } else setBase(null);
+            paint(); return true;
+          }
+          if(pfd&&pfd.conflict){ var rf=await fetch('/api/state',{cache:'no-store'}); var df=await rf.json(); serverKeys=df.keys||{}; srvRev=df.rev||0; continue; }
+        }catch(e){}
+        return false;
+      }
       /* ✨ ZÉRO CONFLIT : quand le même champ a changé des deux côtés, la valeur de
          CE poste (celle que l'utilisateur vient de saisir) est conservée et la fusion
          part quand même — plus jamais de dialogue bloquant. L'événement est journalisé,
@@ -2948,6 +2969,7 @@ var PPSYNC=(function(){
           cm.applyLocal.forEach(function(k){ try{ if(cm.merged[k]!=null) localStorage.setItem(k,cm.merged[k]); }catch(e){} });
           S.applying=false;
           setRev(pd.rev||(srvRev+1)); setDirty(false); S.conflict=false; S.lastOk=Date.now(); S.err=''; S.state='ok';
+          if(pd.rescued&&pd.keys){ _adopterFusion(pd); paint(); return true; }
           setBase(cm.merged);
           /* ✨ Fusion réussie : on applique À CHAUD au lieu de recharger. C'était la
              dernière source de ping-pong — chaque fusion relançait la page, donc une
@@ -2968,6 +2990,20 @@ var PPSYNC=(function(){
       }catch(e){ return false; }
     }
     return false;
+  }
+
+  /* ✨ Le serveur a SAUVÉ des fiches (elles manquaient dans notre photo — poste
+     resté en retard) : on adopte immédiatement son état fusionné, à chaud. */
+  function _adopterFusion(pd){
+    try{
+      S.applying=true;
+      KEYS.forEach(function(k){ try{ if(pd.keys[k]!=null) localStorage.setItem(k,pd.keys[k]); }catch(e){} });
+      S.applying=false;
+      setBase(pd.keys);
+      try{ if(window.ppSoftRefresh) window.ppSoftRefresh(false,'fiches préservées'); }catch(e){}
+      try{ if(typeof toast==='function') toast('🛟 '+pd.rescued+' fiche(s) préservée(s) par le serveur (travail des autres postes)','ok'); }catch(e){}
+      try{ logAct('fusion','serveur : '+pd.rescued+' fiche(s) préservée(s) — photo de ce poste incomplète'); }catch(e){}
+    }catch(e){ S.applying=false; }
   }
 
   var _pushEnCours=false, _pushARefaire=false;
@@ -2997,10 +3033,13 @@ var PPSYNC=(function(){
           S.conflict=true; S.state='conflict'; paint(); return;
         }
       }
-      var _body={keys:snap(),ts:Date.now()}; if(!force) _body.baseRev=S.rev; /* garde serveur anti-écrasement */
+      var _body={keys:snap(),ts:Date.now()}; if(!force) _body.baseRev=S.rev; else _body.force=1; /* garde serveur anti-écrasement */
       var p=await fetch('/api/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(_body)});
       var pd=await p.json();
-      if(pd&&pd.ok){ setRev(pd.rev||(S.rev+1)); setDirty(false); S.conflict=false; S.lastOk=Date.now(); S.err=''; S.state='ok'; setBase(_body.keys); }
+      if(pd&&pd.ok){
+        setRev(pd.rev||(S.rev+1)); setDirty(false); S.conflict=false; S.lastOk=Date.now(); S.err=''; S.state='ok';
+        if(pd.rescued&&pd.keys){ _adopterFusion(pd); } else setBase(_body.keys);
+      }
       else if(pd&&pd.conflict){
         if(!fenetreOuverte()){
           try{ var r3=await fetch('/api/state',{cache:'no-store'}); var d3=await r3.json();
@@ -3471,16 +3510,54 @@ function ppQuotaAlert(sentToServer){
 }
 const DB = {
   data: null,
+  /* ═══ HORODATAGE FICHE PAR FICHE (v5.4) ═══
+     Chaque commande/client/facture… porte un horodatage _ts, mis à jour à chaque
+     vraie modification. Le SERVEUR s'en sert pour arbitrer fiche par fiche : la
+     version la plus récente gagne, et une fiche ajoutée sur un poste ne peut plus
+     être effacée par la photo d'un poste resté en retard. Les suppressions sont
+     détectées automatiquement et consignées en « pierres tombales » (dbs_tombstones),
+     pour qu'une fiche supprimée ne ressuscite pas. */
+  _emp: null,
+  _hRec(r){ var srl=''; try{ var c={}; for(var q in r){ if(q!=='_ts') c[q]=r[q]; } srl=JSON.stringify(c); }catch(e){ srl=String(r&&r.id); }
+    var h=2166136261>>>0; for(var i=0;i<srl.length;i++){ h^=srl.charCodeAt(i); h=Math.imul(h,16777619)>>>0; } return h; },
+  _estFiches(v){ return Array.isArray(v) && v.length>0 && v.every(function(x){ return x&&typeof x==='object'&&!Array.isArray(x)&&x.id!=null; }); },
+  _batir(){ var e={}, d=this.data||{}, self=this;
+    Object.keys(d).forEach(function(k){ var v=d[k]; if(!self._estFiches(v)) return;
+      var m={}; v.forEach(function(r){ m[r.id]=self._hRec(r); }); e[k]=m; });
+    this._emp=e; },
+  _tombLoad(){ try{ var a=JSON.parse(localStorage.getItem('dbs_tombstones')||'[]'); return Array.isArray(a)?a:[]; }catch(e){ return []; } },
+  _tombSave(a){ try{ var now=Date.now();
+    a=a.filter(function(t){ return t&&t.id!=null&&t.k&&(now-(t.ts||0))<7776000000; });   /* 90 jours */
+    if(a.length>4000) a=a.slice(-4000);
+    localStorage.setItem('dbs_tombstones', JSON.stringify(a)); }catch(e){} },
+  _tamponner(){
+    if(!this._emp){ this._batir(); return; }        /* premier passage : référence, aucun marquage */
+    var now=Date.now(), e=this._emp, d=this.data||{}, self=this, tombs=null;
+    Object.keys(d).forEach(function(k){ var v=d[k];
+      if(!Array.isArray(v)) return;
+      if(v.length && !self._estFiches(v)) return;
+      var prev=e[k]||{}, cur={};
+      v.forEach(function(r){ var h=self._hRec(r); cur[r.id]=h;
+        if(prev[r.id]===undefined){ if(!r._ts) r._ts=now; }      /* création */
+        else if(prev[r.id]!==h){ r._ts=now; } });                /* modification réelle */
+      Object.keys(prev).forEach(function(id){ if(cur[id]===undefined){
+        if(!tombs) tombs=self._tombLoad();
+        tombs.push({k:k, id:(isNaN(+id)?id:+id), ts:now}); } });  /* suppression → pierre tombale */
+      e[k]=cur; });
+    if(tombs) this._tombSave(tombs);
+  },
   load(){
     try{
       const raw = localStorage.getItem(DB_KEY);
       if(raw){ this.data = JSON.parse(raw); }
     }catch(e){ console.warn('load failed', e); }
-    if(!this.data){ this.data = this.seed(); this.migrate(); this.save(); }
+    if(!this.data){ this.data = this.seed(); this.migrate(); this._batir(); this.save(); }
+    this._batir();                                   /* référence fraîche : rien n'est marqué au chargement */
     return this.data;
   },
   save(){
     var payload;
+    try{ this._tamponner(); }catch(e){ console.warn('horodatage', e); }
     try{ payload=JSON.stringify(this.data); }
     catch(err){ console.error('serialize failed', err); toast('Erreur interne de sauvegarde','err'); return; }
     try{ if(window.PPRICE&&PPRICE.check) PPRICE.check(this.data); }catch(_){} /* ✨ journal des prix */
@@ -9952,7 +10029,7 @@ function reimportFact(){
   if(typeof nav==='function')nav('stats');
 }
 function backupData(auto){
-  const KEYS=['pilotpro_v2','dbs_overrides_2026','dbs_couts_articles_2026','dbs_deleted_2026','dbs_paiements_2026','dbs_comptes_bancaires','dbs_activity_log','dbs_cmd_photos','dbs_prepa_pj','dbs_gpao_prod_v2','dbs_grandlivre_2026_v2','dbs_taux_eur'];
+  const KEYS=['pilotpro_v2','dbs_overrides_2026','dbs_couts_articles_2026','dbs_deleted_2026','dbs_paiements_2026','dbs_comptes_bancaires','dbs_activity_log','dbs_cmd_photos','dbs_prepa_pj','dbs_gpao_prod_v2','dbs_grandlivre_2026_v2','dbs_taux_eur','dbs_tombstones'];
   const keys={}; KEYS.forEach(k=>{ const v=localStorage.getItem(k); if(v!=null) keys[k]=v; });
   const backup={_app:'PilotPro',_version:2,_type:'global',_date:new Date().toISOString(),keys:keys};
   const a=document.createElement('a');
@@ -9975,7 +10052,7 @@ function backupData(auto){
    La restauration est désormais une opération ATOMIQUE, confirmée par le serveur,
    suivie d'un rechargement AUTOMATIQUE. Un seul import suffit.
 ═══════════════════════════════════════════════════════════════════════════════ */
-const RESTORE_NOMS={pilotpro_v2:'Données principales',dbs_overrides_2026:'Facturation',dbs_couts_articles_2026:'Coûts/marges',dbs_deleted_2026:'Suppressions',dbs_paiements_2026:'Paiements',dbs_comptes_bancaires:'Comptes bancaires',dbs_activity_log:'Journal d\'activité',dbs_cmd_photos:'Photos des commandes',dbs_prepa_pj:'Pièces jointes préparation',dbs_gpao_prod_v2:'GPAO Production',dbs_grandlivre_2026_v2:'Grand Livre',dbs_taux_eur:'Taux EUR'};
+const RESTORE_NOMS={pilotpro_v2:'Données principales',dbs_overrides_2026:'Facturation',dbs_couts_articles_2026:'Coûts/marges',dbs_deleted_2026:'Suppressions',dbs_paiements_2026:'Paiements',dbs_comptes_bancaires:'Comptes bancaires',dbs_activity_log:'Journal d\'activité',dbs_cmd_photos:'Photos des commandes',dbs_prepa_pj:'Pièces jointes préparation',dbs_gpao_prod_v2:'GPAO Production',dbs_grandlivre_2026_v2:'Grand Livre',dbs_taux_eur:'Taux EUR',dbs_tombstones:'Suppressions (pierres tombales)'};
 
 function restoreData(input){
   const f=input.files[0]; if(!f){return;}
@@ -9991,7 +10068,7 @@ function restoreData(input){
     if(!(data&&data.keys&&typeof data.keys==='object')){ toast('Format de sauvegarde non reconnu','err'); input.value=''; return; }
 
     /* ── Contrôle du contenu AVANT d'écrire quoi que ce soit ── */
-    const KEYS=(window.PPSYNC&&PPSYNC._KEYS)||['pilotpro_v2','dbs_overrides_2026','dbs_couts_articles_2026','dbs_deleted_2026','dbs_paiements_2026','dbs_comptes_bancaires','dbs_activity_log','dbs_cmd_photos','dbs_prepa_pj','dbs_gpao_prod_v2','dbs_grandlivre_2026_v2','dbs_taux_eur'];
+    const KEYS=(window.PPSYNC&&PPSYNC._KEYS)||['pilotpro_v2','dbs_overrides_2026','dbs_couts_articles_2026','dbs_deleted_2026','dbs_paiements_2026','dbs_comptes_bancaires','dbs_activity_log','dbs_cmd_photos','dbs_prepa_pj','dbs_gpao_prod_v2','dbs_grandlivre_2026_v2','dbs_taux_eur','dbs_tombstones'];
     const valides={}; const invalides=[]; const modsOk=[];
     KEYS.forEach(k=>{ if(data.keys[k]==null) return;
       try{ if(k!=='dbs_taux_eur') JSON.parse(data.keys[k]); valides[k]=data.keys[k]; modsOk.push(RESTORE_NOMS[k]||k); }
@@ -10366,7 +10443,7 @@ if(document.readyState!=='loading'){ askName(); load().then(listScreen); }
 /* ═══════ MODE SECOURS (?secours) — sauvetage & restauration des données ═══════ */
 (function(){
 if(!/(\?|&)secours/.test(location.search)) return;
-var KEYS=['pilotpro_v2','dbs_overrides_2026','dbs_couts_articles_2026','dbs_deleted_2026','dbs_paiements_2026','dbs_comptes_bancaires','dbs_activity_log','dbs_cmd_photos','dbs_prepa_pj','dbs_gpao_prod_v2','dbs_grandlivre_2026_v2','dbs_taux_eur'];
+var KEYS=['pilotpro_v2','dbs_overrides_2026','dbs_couts_articles_2026','dbs_deleted_2026','dbs_paiements_2026','dbs_comptes_bancaires','dbs_activity_log','dbs_cmd_photos','dbs_prepa_pj','dbs_gpao_prod_v2','dbs_grandlivre_2026_v2','dbs_taux_eur','dbs_tombstones'];
 function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
 function snap(){ var o={}; KEYS.forEach(function(k){ var v=localStorage.getItem(k); if(v!=null) o[k]=v; }); return o; }
 function fmtDT(ts){ try{ return new Date(ts).toLocaleString('fr-FR'); }catch(e){ return String(ts); } }
