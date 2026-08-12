@@ -346,8 +346,21 @@ function mergeAutorite(serverKeys, inKeys) {
       const sv = JSON.parse(serverKeys[k] || 'null');
       const iv = JSON.parse(inKeys[k] || 'null');
       if (_estTableauFiches(sv) && _estTableauFiches(iv)) {
+        if (k === 'dbs_activity_log') {
+          /* ✨ JOURNAL D'ACTIVITÉ : journal ROULANT — même plafond que les postes
+             (3000) et FORME CANONIQUE (tri par date puis id, coupe identique).
+             Sans cela, un serveur à 4000 et des postes à 3000 se « corrigeaient »
+             mutuellement en boucle infinie (≈120 envois/minute constatés).
+             Jamais compté comme « fiches sauvées » : un journal qui roule
+             n'est pas une perte de données. */
+          const poubelle = [];
+          let mergedLog = _fusionTableau(k, sv, iv, tombs, poubelle, horizon);
+          mergedLog.sort((a, b) => ((a.ts || 0) - (b.ts || 0)) || String(a.id).localeCompare(String(b.id)));
+          if (mergedLog.length > 3000) mergedLog = mergedLog.slice(-3000);
+          out[k] = JSON.stringify(mergedLog);
+          return;
+        }
         let merged = _fusionTableau(k, sv, iv, tombs, detail, horizon);
-        if (k === 'dbs_activity_log' && merged.length > 4000) merged = merged.slice(-4000);
         out[k] = JSON.stringify(merged);
       }
     } catch (e) {}
@@ -356,6 +369,20 @@ function mergeAutorite(serverKeys, inKeys) {
   /* 3 · dictionnaires liés aux commandes (photos, pièces jointes, coûts, facturation) :
          les entrées connues seulement du serveur sont conservées ; celles dont la
          commande a une pierre tombale sont retirées. Même clé → le poste gagne. */
+  /* ✨ GPAO et Grand Livre (blocs entiers) : un module chargé À VIDE ne peut
+     JAMAIS écraser une base pleine — l'état quasi vide reçu d'un poste est
+     ignoré tant que le serveur détient des données substantielles. */
+  ['dbs_gpao_prod_v2', 'dbs_grandlivre_2026_v2'].forEach(k => {
+    try {
+      const svL = (serverKeys[k] || '').length, ivL = (inKeys[k] || '').length;
+      /* état reçu ≥10× plus petit qu'une base substantielle = squelette/vide : ignoré */
+      if (svL > 20000 && ivL > 0 && ivL < svL / 10) {
+        out[k] = serverKeys[k];
+        detail.push({ champ: k, sauvees: 1, retirees: 0, exemples: ['module vide ignoré'] });
+      }
+    } catch (e) {}
+  });
+
   /* index du magasin de fichiers : union par entrée, pierres tombales respectées,
      la plus récente gagne — une photo supprimée ne ressuscite pas, une photo
      ajoutée pendant une divergence n'est jamais perdue. */
