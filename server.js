@@ -438,6 +438,17 @@ function mergeAutorite(serverKeys, inKeys) {
   return { keys: out, rescued, changed, detail };
 }
 
+/* ═══ Empreinte de contenu (auto-réparation des postes figés) ═══ */
+const CLES_ETAT = ['pilotpro_v2','dbs_overrides_2026','dbs_couts_articles_2026','dbs_deleted_2026','dbs_paiements_2026','dbs_comptes_bancaires','dbs_activity_log','dbs_blob_idx','dbs_gpao_prod_v2','dbs_grandlivre_2026_v2','dbs_taux_eur','dbs_tombstones'];
+let _empCache = { rev: -1, h: '' };
+function empreinteEtat(s) {
+  if (s && s.rev === _empCache.rev) return _empCache.h;
+  const parts = CLES_ETAT.map(k => k + '=' + h32s((s.keys || {})[k] || ''));
+  const h = h32s(parts.join('|'));
+  _empCache = { rev: s.rev, h };
+  return h;
+}
+
 /* ═══ Clé d'accès ═══ */
 const TOKEN = process.env.PP_TOKEN || '';
 function tokenOk(req) {
@@ -518,7 +529,7 @@ const server = http.createServer((req, res) => {
   /* ───── État partagé (GET) — INCHANGÉ ───── */
   if (url === '/api/state' && req.method === 'GET') {
     Promise.resolve(storage.loadState())
-      .then(s => json(res, 200, s))
+      .then(s => { try { s.h = empreinteEtat(s); } catch (e) {} json(res, 200, s); })
       .catch(e => json(res, 500, { keys: {}, rev: 0, ts: 0, error: String(e) }));
     return;
   }
