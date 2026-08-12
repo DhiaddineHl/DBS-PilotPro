@@ -139,6 +139,61 @@ class PgStore {
       ts timestamptz DEFAULT now(),
       user_name text, order_id text, of_number text, field text,
       old_value double precision, new_value double precision, ip text)`);
+    /* ✨ Magasin de fichiers (photos, pièces jointes) : les images vivent ICI,
+       dans PostgreSQL — plus jamais dans le stockage limité du navigateur. */
+    await this.db.query(`CREATE TABLE IF NOT EXISTS pp_blobs (
+      cle text PRIMARY KEY, donnee text, h text, ts bigint)`);
+    /* ✨ Instantanés de la base DANS PostgreSQL : survivent aux redéploiements
+       Railway (le disque du conteneur, lui, est effacé à chaque déploiement). */
+    await this.db.query(`CREATE TABLE IF NOT EXISTS pp_snapshots (
+      name text PRIMARY KEY, ts bigint, taille int, donnees text)`);
+  }
+
+  /* ─── Instantanés ─── */
+  async snapSave(name, donneesB64, taille) {
+    await this.db.query(
+      'INSERT INTO pp_snapshots(name,ts,taille,donnees) VALUES($1,$2,$3,$4) ON CONFLICT(name) DO NOTHING',
+      [name, Date.now(), taille, donneesB64]);
+  }
+  async snapList() {
+    const r = await this.db.query('SELECT name,ts,taille FROM pp_snapshots ORDER BY ts DESC LIMIT 400');
+    return r.rows.map(x => ({ name: x.name, size: +x.taille || 0, mtime: new Date(+x.ts).toISOString() }));
+  }
+  async snapGet(name) {
+    const r = await this.db.query('SELECT donnees FROM pp_snapshots WHERE name=$1', [name]);
+    return r.rows.length ? r.rows[0].donnees : null;
+  }
+  async snapPrune() {
+    await this.db.query(`DELETE FROM pp_snapshots WHERE name LIKE 'state-daily-%' AND name NOT IN
+      (SELECT name FROM pp_snapshots WHERE name LIKE 'state-daily-%' ORDER BY ts DESC LIMIT 60)`);
+    await this.db.query(`DELETE FROM pp_snapshots WHERE name NOT LIKE 'state-daily-%' AND name NOT IN
+      (SELECT name FROM pp_snapshots WHERE name NOT LIKE 'state-daily-%' ORDER BY ts DESC LIMIT 240)`);
+  }
+
+  /* ─── Magasin de fichiers ─── */
+  async blobSet(cle, donnee, h, ts) {
+    if (donnee == null) {
+      /* suppression = ligne-tombale (donnee NULL) : un ré-envoi plus ancien sera refusé */
+      await this.db.query(
+        'INSERT INTO pp_blobs(cle,donnee,h,ts) VALUES($1,NULL,NULL,$2) ON CONFLICT(cle) DO UPDATE SET donnee=NULL,h=NULL,ts=$2',
+        [cle, Date.now()]);
+      return { ok: true };
+    }
+    const r = await this.db.query(
+      'INSERT INTO pp_blobs(cle,donnee,h,ts) VALUES($1,$2,$3,$4) ' +
+      'ON CONFLICT(cle) DO UPDATE SET donnee=$2,h=$3,ts=$4 ' +
+      'WHERE pp_blobs.donnee IS NOT NULL OR $4 >= pp_blobs.ts',
+      [cle, donnee, h, +ts || Date.now()]);
+    return { ok: true };
+  }
+  async blobGet(cle) {
+    const r = await this.db.query('SELECT donnee FROM pp_blobs WHERE cle=$1 AND donnee IS NOT NULL', [cle]);
+    return r.rows.length ? r.rows[0].donnee : null;
+  }
+  async blobIndex() {
+    const r = await this.db.query('SELECT cle,h FROM pp_blobs WHERE donnee IS NOT NULL');
+    const idx = {}; r.rows.forEach(x => { idx[x.cle] = x.h; });
+    return idx;
   }
 
   /* ─── Journal des prix ─── */

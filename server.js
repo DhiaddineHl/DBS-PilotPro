@@ -108,11 +108,21 @@ function makePgStorage(dburl) {
     async getRev() { await ready; return store.getRev(); },
     async saveState(keys, ts) {
       await ready;
-      // Sauvegarde disque best-effort : au plus une fois par heure (évite de relire l'état à chaque POST)
+      // Sauvegarde best-effort : au plus une fois par heure (évite de relire l'état à chaque POST)
       const hk = hourStamp(new Date());
       if (hk !== lastBackupHour) {
         lastBackupHour = hk;
-        try { const prev = await store.loadState(); hourlyBackup(prev); } catch (e) { /* best-effort */ }
+        try {
+          const prev = await store.loadState();
+          hourlyBackup(prev);                                   /* fichier local (si le disque persiste) */
+          /* ✨ instantané DANS PostgreSQL — survit aux redéploiements Railway */
+          const brut = JSON.stringify(prev);
+          const gz = zlib.gzipSync(Buffer.from(brut, 'utf8')).toString('base64');
+          const now = new Date(); const p2 = n => String(n).padStart(2, '0');
+          await store.snapSave('state-' + hourStamp(now) + '.json', gz, brut.length);
+          await store.snapSave('state-daily-' + now.getFullYear() + '-' + p2(now.getMonth() + 1) + '-' + p2(now.getDate()) + '.json', gz, brut.length);
+          await store.snapPrune();
+        } catch (e) { /* best-effort */ }
       }
       const r = await store.saveState(keys || {}, ts);
       return { rev: r.rev, ts: +ts || Date.now(), updatedAt: new Date().toISOString() };
@@ -130,6 +140,42 @@ function makePgStorage(dburl) {
 
 const usePg = !!DBURL;
 const storage = usePg ? makePgStorage(DBURL) : FileStorage;
+
+/* ════════════════════════════════════════════════════════════════
+   ✨ MAGASIN DE FICHIERS (photos, pièces jointes) — v3.4
+   Les images vivent sur le SERVEUR (PostgreSQL ou data/blobs) et non
+   plus dans le stockage limité du navigateur (5-10 Mo). Le poste ne
+   garde qu'un cache : l'ERP peut grandir sans jamais « être plein ».
+   ════════════════════════════════════════════════════════════════ */
+const BLOBDIR = path.join(DATADIR, 'blobs');
+const BLOBIDX = path.join(BLOBDIR, 'index.json');
+if (!fs.existsSync(BLOBDIR)) fs.mkdirSync(BLOBDIR, { recursive: true });
+function h32s(x) { x = String(x == null ? '' : x); let h = 2166136261 >>> 0; for (let i = 0; i < x.length; i++) { h ^= x.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; } return h.toString(36) + ':' + x.length; }
+function blobFile(cle) { return path.join(BLOBDIR, h32s(cle).replace(':', '_') + '.txt'); }
+const fileBlobs = {
+  _lire() { try { const j = JSON.parse(fs.readFileSync(BLOBIDX, 'utf8')); return (j && j.idx) ? j : { idx: j || {}, dels: {} }; } catch (e) { return { idx: {}, dels: {} }; } },
+  _ecrire(j) { try { const lim = Date.now() - 7 * 86400000; Object.keys(j.dels).forEach(k => { if (j.dels[k] < lim) delete j.dels[k]; }); fs.writeFileSync(BLOBIDX, JSON.stringify(j)); } catch (e) {} },
+  async blobSet(cle, donnee, h, ts) {
+    const j = this._lire();
+    if (donnee == null) {
+      try { fs.unlinkSync(blobFile(cle)); } catch (e) {}
+      delete j.idx[cle]; j.dels[cle] = Date.now();          /* mémoire de suppression */
+    } else {
+      /* un ré-envoi PLUS ANCIEN que la suppression est refusé : un poste en retard
+         ne peut pas faire ressusciter un fichier supprimé */
+      if (j.dels[cle] && (+ts || 0) < j.dels[cle]) return { ok: true, ignore: 1 };
+      fs.writeFileSync(blobFile(cle), donnee); j.idx[cle] = h; delete j.dels[cle];
+    }
+    this._ecrire(j); return { ok: true };
+  },
+  async blobGet(cle) { const j = this._lire(); if (j.idx[cle] == null) return null; try { return fs.readFileSync(blobFile(cle), 'utf8'); } catch (e) { return null; } },
+  async blobIndex() { return this._lire().idx; }
+};
+const blobs = usePg ? {
+  blobSet: (c, d, h, ts) => storage._store.blobSet(c, d, h, ts),
+  blobGet: (c) => storage._store.blobGet(c),
+  blobIndex: () => storage._store.blobIndex()
+} : fileBlobs;
 
 /* ════════════════════════════════════════════════════════════════
    ✨ JOURNAL DES PRIX (modèle bancaire)
@@ -169,6 +215,18 @@ const priceStore = {
    de couper les connexions inactives.
    ════════════════════════════════════════════════════════════════ */
 const sseClients = new Set();
+/* ✨ PRÉSENCE EN DIRECT : qui est connecté, sur quel module, sur quelle fiche.
+   En mémoire seulement (éphémère par nature) ; purgé après 35 s sans battement. */
+const presence = {};
+function presencePropre() {
+  const lim = Date.now() - 35000;
+  Object.keys(presence).forEach(k => { if (presence[k].ts < lim) delete presence[k]; });
+  return Object.values(presence);
+}
+function presenceBroadcast() {
+  const payload = 'data: ' + JSON.stringify({ presence: presencePropre() }) + '\n\n';
+  for (const c of sseClients) { try { c.write(payload); } catch (e) { sseClients.delete(c); } }
+}
 function sseBroadcast(rev, restore) {
   /* ✨ restore:1 → il ne s'agit pas d'un enregistrement ordinaire mais de la
      RESTAURATION d'une sauvegarde : les autres postes doivent adopter cet état
@@ -298,6 +356,29 @@ function mergeAutorite(serverKeys, inKeys) {
   /* 3 · dictionnaires liés aux commandes (photos, pièces jointes, coûts, facturation) :
          les entrées connues seulement du serveur sont conservées ; celles dont la
          commande a une pierre tombale sont retirées. Même clé → le poste gagne. */
+  /* index du magasin de fichiers : union par entrée, pierres tombales respectées,
+     la plus récente gagne — une photo supprimée ne ressuscite pas, une photo
+     ajoutée pendant une divergence n'est jamais perdue. */
+  try {
+    const sv = JSON.parse(serverKeys['dbs_blob_idx'] || 'null');
+    const iv = JSON.parse(inKeys['dbs_blob_idx'] || 'null');
+    if (sv && iv && typeof sv === 'object' && typeof iv === 'object') {
+      const norm = v => (v && typeof v === 'object') ? v : { h: String(v || ''), ts: 0 };
+      const R = {};
+      Object.keys(sv).forEach(k => { R[k] = norm(sv[k]); });
+      Object.keys(iv).forEach(k => {
+        const e = norm(iv[k]);
+        if (R[k] == null || (e.ts || 0) >= (R[k].ts || 0)) R[k] = e;
+      });
+      Object.keys(R).forEach(k => {
+        const tb = tombs['blob ' + k] || 0;
+        if (tb > (R[k].ts || 0)) delete R[k];          /* supprimée plus récemment */
+        else if (iv[k] == null && sv[k] != null && tb) delete R[k];
+      });
+      out['dbs_blob_idx'] = JSON.stringify(R);
+    }
+  } catch (e) {}
+
   ['dbs_cmd_photos', 'dbs_prepa_pj', 'dbs_overrides_2026', 'dbs_couts_articles_2026'].forEach(k => {
     try {
       const sv = JSON.parse(serverKeys[k] || 'null');
@@ -328,6 +409,20 @@ function mergeAutorite(serverKeys, inKeys) {
   detail.forEach(d => { rescued += (d.sauvees || 0); });
   const changed = detail.length > 0;
   return { keys: out, rescued, changed, detail };
+}
+
+/* ═══ Clé d'accès ═══ */
+const TOKEN = process.env.PP_TOKEN || '';
+function tokenOk(req) {
+  if (!TOKEN) return true;                       /* non configurée : ouvert (comme avant) */
+  try {
+    const q = new URLSearchParams((req.url.split('?')[1] || ''));
+    if (q.get('t') === TOKEN) return true;
+    if (String(req.headers['x-pp-token'] || '') === TOKEN) return true;
+    const c = String(req.headers.cookie || '');
+    if (c.split(/;\s*/).some(x => x === 'pp_t=' + encodeURIComponent(TOKEN) || x === 'pp_t=' + TOKEN)) return true;
+  } catch (e) {}
+  return false;
 }
 
 /* ═══ HTTP helpers ═══ */
@@ -368,6 +463,15 @@ function json(res, code, obj) {
 const server = http.createServer((req, res) => {
   const url = decodeURIComponent(req.url.split('?')[0]);
 
+  /* ═══ ✨ CLÉ D'ACCÈS (v3.5) : si PP_TOKEN est défini dans les variables Railway,
+     TOUTES les données exigent la clé — en-tête, cookie ou paramètre d'URL.
+     L'application elle-même reste servie (l'écran de connexion la protège) ;
+     ce sont les DONNÉES qui sont verrouillées. ═══ */
+  if (url.startsWith('/api/') && !tokenOk(req)) {
+    json(res, 401, { ok: false, auth: 1, error: 'clé d\'accès requise' });
+    return;
+  }
+
   /* ───── ✨ Temps réel : flux d'événements (SSE) ───── */
   if (url === '/api/events' && req.method === 'GET') {
     res.writeHead(200, {
@@ -389,6 +493,54 @@ const server = http.createServer((req, res) => {
     Promise.resolve(storage.loadState())
       .then(s => json(res, 200, s))
       .catch(e => json(res, 500, { keys: {}, rev: 0, ts: 0, error: String(e) }));
+    return;
+  }
+
+  /* ───── ✨ Présence en direct ───── */
+  if (url === '/api/presence' && req.method === 'POST') {
+    readBody(req, body => {
+      try {
+        const p = JSON.parse(body || '{}');
+        const cle = String(p.poste || p.u || '?').slice(0, 60);
+        const avant = JSON.stringify(presence[cle] ? [presence[cle].mod, presence[cle].fiche] : null);
+        presence[cle] = { poste: cle, u: String(p.u || '').slice(0, 60), mod: String(p.mod || '').slice(0, 40),
+                          fiche: p.fiche == null ? null : String(p.fiche).slice(0, 40), ts: Date.now() };
+        json(res, 200, { ok: true, presence: presencePropre() });
+        /* diffusion seulement quand quelque chose change (pas à chaque battement) */
+        if (avant !== JSON.stringify([presence[cle].mod, presence[cle].fiche])) presenceBroadcast();
+      } catch (e) { json(res, 400, { ok: false }); }
+    });
+    return;
+  }
+  if (url === '/api/presence' && req.method === 'GET') {
+    json(res, 200, { ok: true, presence: presencePropre() });
+    return;
+  }
+
+  /* ───── ✨ Magasin de fichiers (photos, pièces jointes) ───── */
+  if (url === '/api/blobs' && req.method === 'GET') {
+    blobs.blobIndex().then(idx => json(res, 200, { ok: true, idx }))
+      .catch(e => json(res, 500, { ok: false, error: String(e && e.message || e) }));
+    return;
+  }
+  if (url.startsWith('/api/blob') && !url.startsWith('/api/blobs') && req.method === 'GET') {
+    const q = new URLSearchParams(req.url.split('?')[1] || '');
+    const cle = q.get('k') || '';
+    if (!cle) { json(res, 400, { ok: false, error: 'k manquant' }); return; }
+    blobs.blobGet(cle).then(v => json(res, 200, { ok: true, k: cle, v }))
+      .catch(e => json(res, 500, { ok: false, error: String(e && e.message || e) }));
+    return;
+  }
+  if (url === '/api/blob' && req.method === 'POST') {
+    readBody(req, async body => {
+      try {
+        const p = JSON.parse(body || '{}');
+        if (!p.k) { json(res, 400, { ok: false, error: 'k manquant' }); return; }
+        const h = p.v == null ? null : h32s(p.v);
+        const rs = await blobs.blobSet(String(p.k).slice(0, 200), p.v == null ? null : String(p.v), h, +p.ts || 0);
+        json(res, 200, { ok: true, k: p.k, h, ignore: (rs && rs.ignore) || 0 });
+      } catch (e) { json(res, 400, { ok: false, error: String(e && e.message || e) }); }
+    });
     return;
   }
 
@@ -488,21 +640,47 @@ const server = http.createServer((req, res) => {
 
   /* ───── Sauvegardes (liste / téléchargement / restauration) ───── */
   if (url === '/api/backups' && req.method === 'GET') {
-    try {
-      const files = fs.readdirSync(BKDIR).filter(x => /^state-.*\.json$/.test(x)).sort().reverse()
-        .map(n => { const st = fs.statSync(path.join(BKDIR, n)); return { name: n, size: st.size, mtime: st.mtime.toISOString() }; });
-      json(res, 200, { ok: true, backups: files });
-    } catch (e) { json(res, 500, { ok: false, error: String(e) }); }
+    (async () => {
+      try {
+        let files = [];
+        try {
+          files = fs.readdirSync(BKDIR).filter(x => /^state-.*\.json$/.test(x))
+            .map(n => { const st = fs.statSync(path.join(BKDIR, n)); return { name: n, size: st.size, mtime: st.mtime.toISOString() }; });
+        } catch (e) {}
+        if (usePg) {
+          try {
+            const snaps = await storage._store.snapList();
+            const vus = new Set(files.map(f => f.name));
+            snaps.forEach(sn => { if (!vus.has(sn.name)) files.push(sn); });
+          } catch (e) {}
+        }
+        files.sort((a, b) => (a.name < b.name ? 1 : -1));
+        json(res, 200, { ok: true, backups: files });
+      } catch (e) { json(res, 500, { ok: false, error: String(e) }); }
+    })();
     return;
   }
   if (url.startsWith('/api/backups/') && req.method === 'GET') {
     const name = url.slice('/api/backups/'.length);
     if (!/^state-[\w\-\.]+\.json$/.test(name)) { json(res, 400, { ok: false, error: 'nom invalide' }); return; }
     const f = path.join(BKDIR, name);
-    if (!fs.existsSync(f)) { json(res, 404, { ok: false, error: 'introuvable' }); return; }
-    logAudit('backup_downloaded', { name });
-    res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Disposition': 'attachment; filename="' + name + '"' });
-    fs.createReadStream(f).pipe(res);
+    if (fs.existsSync(f)) {
+      logAudit('backup_downloaded', { name });
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Disposition': 'attachment; filename="' + name + '"' });
+      fs.createReadStream(f).pipe(res);
+      return;
+    }
+    if (usePg) {
+      storage._store.snapGet(name).then(gz => {
+        if (!gz) { json(res, 404, { ok: false, error: 'introuvable' }); return; }
+        logAudit('backup_downloaded', { name, source: 'postgres' });
+        const brut = zlib.gunzipSync(Buffer.from(gz, 'base64'));
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Disposition': 'attachment; filename="' + name + '"' });
+        res.end(brut);
+      }).catch(e => json(res, 500, { ok: false, error: String(e && e.message || e) }));
+      return;
+    }
+    json(res, 404, { ok: false, error: 'introuvable' });
     return;
   }
   if (url === '/api/restore' && req.method === 'POST') {
@@ -510,12 +688,19 @@ const server = http.createServer((req, res) => {
       try {
         const { name } = JSON.parse(body || '{}');
         if (!/^state-[\w\-\.]+\.json$/.test(String(name))) { json(res, 400, { ok: false, error: 'nom invalide' }); return; }
+        let bk = null;
         const f = path.join(BKDIR, name);
-        const bk = JSON.parse(fs.readFileSync(f, 'utf8'));
+        if (fs.existsSync(f)) bk = JSON.parse(fs.readFileSync(f, 'utf8'));
+        else if (usePg) { const gz = await storage._store.snapGet(name);
+          if (gz) bk = JSON.parse(zlib.gunzipSync(Buffer.from(gz, 'base64')).toString('utf8')); }
+        if (!bk) { json(res, 404, { ok: false, error: 'instantané introuvable' }); return; }
+        /* horizon : les postes en retard ne réinjecteront pas ce que cette
+           restauration retire volontairement */
+        bk.keys = Object.assign({}, bk.keys, { pp_restore_horizon: String(Date.now()) });
         const r = await storage.restore(bk, name);
         logAudit('backup_restored', { name, newRev: r.rev });
         json(res, 200, { ok: true, rev: r.rev });
-        sseBroadcast(r.rev);                 /* ✨ les postes rechargent la restauration */
+        sseBroadcast(r.rev, 1);              /* ✨ les postes ADOPTENT la restauration telle quelle */
       } catch (e) { json(res, 400, { ok: false, error: String(e && e.message || e) }); }
     });
     return;

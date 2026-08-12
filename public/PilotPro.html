@@ -2708,8 +2708,32 @@ var qrcode = function() {
    au démarrage, au retour sur l'onglet et toutes les 60 s ·
    indicateur d'état · anti-écrasement + copie de secours.
    ═══════════════════════════════════════════════════════════ */
+/* ✨ CLÉ D'ACCÈS : mémorisée sur ce poste (jamais synchronisée) et posée en cookie —
+   toutes les requêtes du poste, des modules embarqués et des portails la portent
+   automatiquement. Distribuée par l'administrateur (variable PP_TOKEN sur Railway). */
+(function(){
+  try{
+    var m=location.search.match(/[?&]t=([^&]+)/);
+    if(m) localStorage.setItem('pp_api_token', decodeURIComponent(m[1]));
+    var tk=localStorage.getItem('pp_api_token');
+    if(tk) document.cookie='pp_t='+encodeURIComponent(tk)+'; path=/; max-age=31536000; SameSite=Lax';
+  }catch(e){}
+})();
+window.ppCleDemander=function(){
+  if(window._ppCleDemandee) return; window._ppCleDemandee=true;
+  setTimeout(function(){
+    var tk=prompt('🔐 Ce serveur exige une clé d\'accès.\n\nDemandez-la à votre administrateur, puis saisissez-la ici :');
+    window._ppCleDemandee=false;
+    if(tk&&tk.trim()){
+      try{ localStorage.setItem('pp_api_token', tk.trim());
+        document.cookie='pp_t='+encodeURIComponent(tk.trim())+'; path=/; max-age=31536000; SameSite=Lax'; }catch(e){}
+      location.reload();
+    }
+  },50);
+};
+
 var PPSYNC=(function(){
-  var KEYS=['pilotpro_v2','dbs_overrides_2026','dbs_couts_articles_2026','dbs_deleted_2026','dbs_paiements_2026','dbs_comptes_bancaires','dbs_activity_log','dbs_cmd_photos','dbs_prepa_pj','dbs_gpao_prod_v2','dbs_grandlivre_2026_v2','dbs_taux_eur','dbs_tombstones'];
+  var KEYS=['pilotpro_v2','dbs_overrides_2026','dbs_couts_articles_2026','dbs_deleted_2026','dbs_paiements_2026','dbs_comptes_bancaires','dbs_activity_log','dbs_blob_idx','dbs_gpao_prod_v2','dbs_grandlivre_2026_v2','dbs_taux_eur','dbs_tombstones'];
   var isPortal=/(\?|&)(atelier|secours)/.test(location.search);
   var enabled=(location.protocol==='http:'||location.protocol==='https:')&&!isPortal;
   var S={ state:enabled?'init':'local', ready:false, dirty:false, conflict:false, applying:false,
@@ -2717,6 +2741,19 @@ var PPSYNC=(function(){
   try{ S.dirty = localStorage.getItem('pp_sync_dirty')==='1'; }catch(e){}
 
   var OVR={}; /* secours quota : dernières données en MÉMOIRE quand localStorage est plein */
+  /* ✨ Écriture robuste : si le stockage est plein, on libère d'abord les copies
+     dispensables (vieille copie de secours, empreinte non compressée) et on
+     réessaie ; en dernier recours la valeur reste en mémoire (OVR) — l'écran et
+     le serveur voient la BONNE valeur, plus jamais de retour en arrière. */
+  function _ecrire(k,v){
+    try{ localStorage.setItem(k,v); if(OVR[k]!=null) delete OVR[k]; return true; }catch(e){}
+    try{ localStorage.removeItem('pp_preseed_backup'); }catch(e){}
+    try{ localStorage.removeItem('pp_sync_base'); }catch(e){}
+    try{ localStorage.setItem(k,v); if(OVR[k]!=null) delete OVR[k]; return true; }catch(e){}
+    OVR[k]=v;
+    try{ if(typeof ppQuotaAlert==='function') ppQuotaAlert(true); }catch(e){}
+    return false;
+  }
   function snap(){ var o={}; KEYS.forEach(function(k){ var v=(OVR[k]!=null)?OVR[k]:localStorage.getItem(k); if(v!=null)o[k]=v; }); return o; }
   function overrideKey(k,v){ if(KEYS.indexOf(k)<0) return; OVR[k]=v; try{ markDirty(); }catch(e){} setTimeout(function(){ try{ markDirty(); }catch(e){} },4000); }
   function clearOverride(k){ if(OVR[k]!=null) delete OVR[k]; }
@@ -2771,11 +2808,47 @@ var PPSYNC=(function(){
      pendant que Raouia → Grand Livre), elles sont fusionnées et envoyées automatiquement.
      Le dialogue de conflit n'apparaît que si la MÊME clé a changé des deux côtés. */
   function h32(s){ s=String(s==null?'':s); var h=2166136261>>>0; for(var i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=Math.imul(h,16777619)>>>0; } return h.toString(36)+':'+s.length; }
-  function getBase(){ try{ return JSON.parse(localStorage.getItem('pp_sync_base')||'null')||null; }catch(e){ return null; } }
+  /* ✨ v5.5 — l'empreinte de fusion est désormais COMPRESSÉE (gzip, ≈10× plus
+     petite). Avant, elle stockait une copie complète de la base : avec la copie de
+     secours, le navigateur gardait 3× les données → stockage plein → écritures
+     refusées → le poste renvoyait sans cesse une photo incomplète → boucle de
+     « fiches préservées » et « envoi en cours » permanente. */
+  async function _gzipB64(str){
+    var cs=new CompressionStream('gzip');
+    var ab=await new Response(new Blob([str]).stream().pipeThrough(cs)).arrayBuffer();
+    var u=new Uint8Array(ab), out=''; for(var i=0;i<u.length;i+=32768) out+=String.fromCharCode.apply(null,u.subarray(i,i+32768));
+    return btoa(out);
+  }
+  async function _gunzipB64(b64){
+    var bin=atob(b64), u=new Uint8Array(bin.length); for(var i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i);
+    var ds=new DecompressionStream('gzip');
+    return await new Response(new Blob([u]).stream().pipeThrough(ds)).text();
+  }
+  async function getBase(){
+    try{ var z=localStorage.getItem('pp_sync_base_z'); if(z) return JSON.parse(await _gunzipB64(z))||null; }catch(e){}
+    try{ return JSON.parse(localStorage.getItem('pp_sync_base')||'null')||null; }catch(e){ return null; }
+  }
+  function hasFullBase(){ try{ return !!(localStorage.getItem('pp_sync_base_z')||localStorage.getItem('pp_sync_base')); }catch(e){ return false; } }
   function getBaseH(){ try{ return JSON.parse(localStorage.getItem('pp_sync_base_h')||'null')||null; }catch(e){ return null; } }
   function setBase(keys){
     var b={}; KEYS.forEach(function(k){ b[k]=(keys&&keys[k]!=null)?keys[k]:localStorage.getItem(k); });
-    try{ localStorage.setItem('pp_sync_base',JSON.stringify(b)); }catch(e){}
+    (async function(){
+      try{
+        var srl=JSON.stringify(b);
+        if(window.CompressionStream){
+          var z=await _gzipB64(srl);
+          localStorage.setItem('pp_sync_base_z', z);
+          try{ localStorage.removeItem('pp_sync_base'); }catch(e){}
+        } else {
+          localStorage.setItem('pp_sync_base', srl);
+        }
+      }catch(e){
+        /* stockage plein : on ne garde JAMAIS une copie périmée (source de fausses
+           détections et de boucles d'envoi) — les hachages suffisent pour détecter */
+        try{ localStorage.removeItem('pp_sync_base'); }catch(_){}
+        try{ localStorage.removeItem('pp_sync_base_z'); }catch(_){}
+      }
+    })();
     /* ✨ Empreinte de secours par hachage : quelques octets par clé, tient TOUJOURS
        dans le stockage — même plein. Sans elle, un stockage saturé rendait la
        détection des saisies GPAO/Grand Livre silencieusement inopérante. */
@@ -2788,12 +2861,12 @@ var PPSYNC=(function(){
      version connue, et programme un envoi si l'une d'elles a changé sans qu'on le sache. */
   function checkExternalChanges(force){
     if(!enabled||S.applying||(!S.ready&&!force)||S.dirty) return;
-    var base=getBase(), bh=getBaseH();
-    if(!base&&!bh) return;
+    var bh=getBaseH();
+    if(!bh) return;
     for(var i=0;i<KEYS.length;i++){
-      var k=KEYS[i]; var cur=localStorage.getItem(k);
-      if(base){ if(cur!==base[k]){ markDirty(force); return; } }
-      else if(bh && h32(cur)!==bh[k]){ markDirty(force); return; }
+      var k=KEYS[i];
+      var cur=(OVR[k]!=null)?OVR[k]:localStorage.getItem(k);   /* même vérité que snap() */
+      if(h32(cur)!==bh[k]){ markDirty(force); return; }
     }
   }
   /* ═══ Moteur de fusion fiche par fiche (commande par commande, compte par compte...)
@@ -2891,8 +2964,8 @@ var PPSYNC=(function(){
     });
     return {merged:out, hasConflict:anyConflict};
   }
-  function computeMerge(serverKeys){
-    var base=getBase(); if(!base) return null;
+  async function computeMerge(serverKeys){
+    var base=await getBase(); if(!base) return null;
     var mine=snap(); var merged={}, conflicts=[], applyLocal=[];
     KEYS.forEach(function(k){
       var l=(mine[k]!=null)?mine[k]:null, s=(serverKeys[k]!=null)?serverKeys[k]:null;
@@ -2935,7 +3008,7 @@ var PPSYNC=(function(){
   }
   async function tryAutoMerge(serverKeys, srvRev){
     for(var att=0; att<3; att++){
-      var cm=computeMerge(serverKeys);
+      var cm=await computeMerge(serverKeys);
       if(!cm){
         /* ✨ Pas d'empreinte de fusion (stockage plein, poste ancien…) : avant, on
            levait un CONFLIT bloquant — et le choix manuel pouvait écraser le travail
@@ -2946,7 +3019,7 @@ var PPSYNC=(function(){
           var pfd=await pf.json();
           if(pfd&&pfd.ok){
             setRev(pfd.rev||(srvRev+1)); setDirty(false); S.conflict=false; S.lastOk=Date.now(); S.err=''; S.state='ok';
-            if(pfd.rescued&&pfd.keys){ _adopterFusion(pfd); } else setBase(null);
+            if(pfd.keys){ _adopterFusion(pfd); } else setBase(null);
             paint(); return true;
           }
           if(pfd&&pfd.conflict){ var rf=await fetch('/api/state',{cache:'no-store'}); var df=await rf.json(); serverKeys=df.keys||{}; srvRev=df.rev||0; continue; }
@@ -2959,7 +3032,7 @@ var PPSYNC=(function(){
          et le journal des prix garde de toute façon l'historique bancaire des prix. */
       if(cm.conflicts.length){
         try{ logAct('fusion','résolution automatique — champ(s) disputé(s) sur : '+cm.conflicts.join(', ')+' (valeur de ce poste conservée)'); }catch(e){}
-        try{ if(typeof toast==='function') toast('🔀 Fusion automatique — votre saisie a été conservée','ok'); }catch(e){}
+        toastCalme('fusion','🔀 Fusion automatique — votre saisie a été conservée','ok');
       }
       try{
         var p=await fetch('/api/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys:cm.merged,ts:Date.now(),baseRev:srvRev})});
@@ -2969,7 +3042,7 @@ var PPSYNC=(function(){
           cm.applyLocal.forEach(function(k){ try{ if(cm.merged[k]!=null) localStorage.setItem(k,cm.merged[k]); }catch(e){} });
           S.applying=false;
           setRev(pd.rev||(srvRev+1)); setDirty(false); S.conflict=false; S.lastOk=Date.now(); S.err=''; S.state='ok';
-          if(pd.rescued&&pd.keys){ _adopterFusion(pd); paint(); return true; }
+          if(pd.keys){ _adopterFusion(pd); paint(); return true; }
           setBase(cm.merged);
           /* ✨ Fusion réussie : on applique À CHAUD au lieu de recharger. C'était la
              dernière source de ping-pong — chaque fusion relançait la page, donc une
@@ -2994,15 +3067,24 @@ var PPSYNC=(function(){
 
   /* ✨ Le serveur a SAUVÉ des fiches (elles manquaient dans notre photo — poste
      resté en retard) : on adopte immédiatement son état fusionné, à chaud. */
+  /* Messages de synchronisation APAISÉS : chaque type de message ne s'affiche
+     qu'une fois toutes les 3 minutes — l'information reste, le clignotement non. */
+  var _tCalme={};
+  function toastCalme(cle,msg,type){
+    var now=Date.now();
+    if(_tCalme[cle]&&now-_tCalme[cle]<180000) return;
+    _tCalme[cle]=now;
+    try{ if(typeof toast==='function') toast(msg,type||'ok'); }catch(e){}
+  }
   function _adopterFusion(pd){
     try{
       S.applying=true;
-      KEYS.forEach(function(k){ try{ if(pd.keys[k]!=null) localStorage.setItem(k,pd.keys[k]); }catch(e){} });
+      KEYS.forEach(function(k){ try{ if(pd.keys[k]!=null) _ecrire(k,pd.keys[k]); }catch(e){} });
       S.applying=false;
       setBase(pd.keys);
       try{ if(window.ppSoftRefresh) window.ppSoftRefresh(false,'fiches préservées'); }catch(e){}
-      try{ if(typeof toast==='function') toast('🛟 '+pd.rescued+' fiche(s) préservée(s) par le serveur (travail des autres postes)','ok'); }catch(e){}
-      try{ logAct('fusion','serveur : '+pd.rescued+' fiche(s) préservée(s) — photo de ce poste incomplète'); }catch(e){}
+      if(pd.rescued) toastCalme('sauve','🛟 '+pd.rescued+' fiche(s) préservée(s) par le serveur (travail des autres postes)','ok');
+      try{ if(pd.rescued) logAct('fusion','serveur : '+pd.rescued+' fiche(s) préservée(s) — photo de ce poste incomplète'); }catch(e){}
     }catch(e){ S.applying=false; }
   }
 
@@ -3033,12 +3115,27 @@ var PPSYNC=(function(){
           S.conflict=true; S.state='conflict'; paint(); return;
         }
       }
-      var _body={keys:snap(),ts:Date.now()}; if(!force) _body.baseRev=S.rev; else _body.force=1; /* garde serveur anti-écrasement */
+      /* ✨ ENVOI DIFFÉRENTIEL : seules les clés dont l'empreinte a changé partent au
+         serveur (quelques Ko au lieu de ~2 Mo) — le serveur complète avec ses clés
+         inchangées lors de la fusion. Envoi complet si les empreintes manquent ou
+         en cas d'envoi forcé (admin). */
+      var _keys=snap();
+      if(!force && typeof srvHas!=='undefined' && srvHas){
+        try{
+          var _bh=getBaseH();
+          if(_bh){
+            var _diff={}, _n=0, _tot=0;
+            Object.keys(_keys).forEach(function(k){ _tot++; if(h32(_keys[k])!==_bh[k]){ _diff[k]=_keys[k]; _n++; } });
+            if(_n>0&&_n<_tot){ _keys=_diff; }
+          }
+        }catch(e){}
+      }
+      var _body={keys:_keys,ts:Date.now()}; if(!force) _body.baseRev=S.rev; else _body.force=1; /* garde serveur anti-écrasement */
       var p=await fetch('/api/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(_body)});
       var pd=await p.json();
       if(pd&&pd.ok){
         setRev(pd.rev||(S.rev+1)); setDirty(false); S.conflict=false; S.lastOk=Date.now(); S.err=''; S.state='ok';
-        if(pd.rescued&&pd.keys){ _adopterFusion(pd); } else setBase(_body.keys);
+        if(pd.keys){ _adopterFusion(pd); } else setBase(null); /* empreinte = état local complet */
       }
       else if(pd&&pd.conflict){
         if(!fenetreOuverte()){
@@ -3047,7 +3144,7 @@ var PPSYNC=(function(){
         } else { schedule(); return; }
         S.conflict=true; S.state='conflict';
       }
-      else { S.state='err'; S.err=(pd&&pd.error)||'réponse invalide'; }
+      else { S.state='err'; S.err=(pd&&pd.error)||'réponse invalide'; if(pd&&pd.auth){ try{ window.ppCleDemander(); }catch(e){} } }
     }catch(e){ S.state='off'; S.err='serveur injoignable'; }
     paint();
   }
@@ -3055,9 +3152,11 @@ var PPSYNC=(function(){
   function applyServer(keys,srvRev,boot){
     if(_restoreLock) return; /* jamais pendant une restauration */
     try{ if(localStorage.getItem('pp_restore_pending')==='1') return; }catch(e){}
-    try{ localStorage.setItem('pp_preseed_backup', JSON.stringify({_date:new Date().toISOString(), keys:snap()})); }catch(e){}
+    /* (la copie de secours locale pp_preseed_backup a été SUPPRIMÉE : elle doublait
+       toute la base à chaque réception et saturait le stockage du navigateur —
+       le serveur garde des sauvegardes horaires, bien plus sûres) */
     S.applying=true;
-    KEYS.forEach(function(k){ try{ if(keys[k]!=null) localStorage.setItem(k,keys[k]); }catch(e){} });
+    KEYS.forEach(function(k){ try{ if(keys[k]!=null) _ecrire(k,keys[k]); }catch(e){} });
     S.applying=false;
     setRev(srvRev); setDirty(false); S.conflict=false; S.lastOk=Date.now(); S.state='ok';
     setBase(null); /* empreinte de fusion = état fraîchement appliqué */
@@ -3085,6 +3184,7 @@ var PPSYNC=(function(){
     try{ checkExternalChanges(true); }catch(e){}
     try{
       var r=await fetch('/api/state',{cache:'no-store'}); var d=await r.json();
+      if(d&&d.auth){ S.state='err'; S.err='clé d\'accès requise'; try{ window.ppCleDemander(); }catch(e){} finishBoot(opts); paint(); return; }
       var srvRev=d.rev||0, keys=d.keys||{};
       var srvHas=Object.keys(keys).length>0;
       if(!srvHas){
@@ -3093,7 +3193,7 @@ var PPSYNC=(function(){
         if(hasData()){ setDirty(true); schedule(); }
         finishBoot(opts); paint(); return;
       }
-      if(srvRev===S.rev){ S.state=S.dirty?'dirty':'ok'; S.lastOk=Date.now(); if(!S.dirty&&(!getBase()||!getBaseH())) setBase(null); /* amorce l'empreinte de fusion (complète + hachée) */ if(S.dirty) schedule(); finishBoot(opts); paint(); return; }
+      if(srvRev===S.rev){ S.state=S.dirty?'dirty':'ok'; S.lastOk=Date.now(); if(!S.dirty&&(!hasFullBase()||!getBaseH())) setBase(null); /* amorce l'empreinte de fusion (complète + hachée) */ if(S.dirty) schedule(); finishBoot(opts); paint(); return; }
       /* Le serveur a une version différente de la nôtre */
       if(S.dirty){
         /* Cas fréquent : notre dernier beacon de fermeture a réussi → le serveur contient
@@ -3123,6 +3223,8 @@ var PPSYNC=(function(){
         Object.keys(u).forEach(function(k){ if((loc[k]||null)!==(keys[k]||null)) pareil=false; });
         if(pareil){ setRev(srvRev); S.state='ok'; S.lastOk=Date.now(); setBase(keys); finishBoot(opts); paint(); return; }
       }catch(e){}
+      finishBoot(opts);   /* prêt dès maintenant : une saisie faite pendant l'application
+                             des données part au serveur sans attendre la boucle de 60 s */
       applyServer(keys,srvRev,!!opts.boot);
     }catch(e){ S.state='off'; S.err='serveur injoignable'; finishBoot(opts); paint(); }
   }
@@ -3242,8 +3344,8 @@ var PPSYNC=(function(){
     /* 1 · écriture des clés (le verrou neutralise markDirty pendant l'opération) */
     KEYS.forEach(function(k){
       if(keys[k]==null) return;
-      try{ localStorage.setItem(k, keys[k]); delete OVR[k]; res.ecrites++; }
-      catch(e){ res.erreurs.push(k); try{ OVR[k]=keys[k]; }catch(_){} } /* stockage plein : on garde en mémoire pour l'envoi */
+      if(_ecrire(k, keys[k])) res.ecrites++;
+      else res.erreurs.push(k); /* stockage plein : gardée en mémoire, part quand même au serveur */
     });
     /* 2 · mémoire de la page réalignée IMMÉDIATEMENT sur les données restaurées.
            ⚠️ DB et ds sont déclarés avec const/let : ils N'EXISTENT PAS sur `window`.
@@ -3322,6 +3424,7 @@ var PPSYNC=(function(){
       es.onmessage=function(ev){
         try{
           var d=JSON.parse(ev.data||'{}');
+          if(d.presence){ try{ if(window.PPPRES) PPPRES.recevoir(d.presence); }catch(e){} return; }
           if(typeof d.rev!=='number') return;
           if(d.rev<=S.rev) return;      /* notre propre enregistrement, ou déjà reçu */
           if(S.applying||_restoreLock) return;
@@ -3356,6 +3459,9 @@ var PPSYNC=(function(){
 
   /* ── Démarrage & boucles ── */
   function start(){
+    /* grand nettoyage : ces copies saturaient le stockage (3× la base) */
+    try{ localStorage.removeItem('pp_preseed_backup'); }catch(e){}
+    try{ if(localStorage.getItem('pp_sync_base_z')) localStorage.removeItem('pp_sync_base'); }catch(e){}
     paint();
     if(!enabled){ S.ready=true; return; }
     pull({boot:true});
@@ -3392,7 +3498,7 @@ var PPSYNC=(function(){
   return { markDirty:markDirty, push:push, pull:pull, dialog:dialog, syncNow:syncNow,
            overrideKey:overrideKey, _clearOverride:clearOverride,
            forcePush:forcePush, forcePull:forcePull, snap:snap, paint:paint,
-           restaurer:restaurer, _KEYS:KEYS,
+           restaurer:restaurer, _KEYS:KEYS, _ovr:OVR,
            _S:S, _enabled:enabled,
            /* ✨ COUPE-CIRCUIT ANTI PING-PONG : au-delà de 2 rechargements en 60 s, on
               refuse de recharger et on bascule définitivement en mise à jour à chaud.
@@ -3486,6 +3592,239 @@ var PPRICE=(function(){
   return {check:check, flush:flush};
 })();
 
+/* ═══════════════════════════════════════════════════════════
+   COUCHE PPBLOB — MAGASIN DE FICHIERS (photos, pièces jointes)
+   ─────────────────────────────────────────────────────────────
+   Les images vivent sur le SERVEUR (PostgreSQL / Railway — espace
+   quasi illimité). Le poste garde :
+     · un cache local dans IndexedDB (des centaines de Mo autorisés,
+       contre 5-10 Mo pour l'ancien stockage qui saturait) ;
+     · un INDEX léger (dbs_blob_idx) synchronisé entre postes —
+       c'est lui qui dit à chaque poste quoi télécharger.
+   Un ERP qui grandit ne doit JAMAIS demander de supprimer des données.
+═══════════════════════════════════════════════════════════ */
+var PPBLOB=(function(){
+  var MEM={};
+  var actif=(location.protocol==='http:'||location.protocol==='https:');
+  function h32b(x){ x=String(x==null?'':x); var h=2166136261>>>0; for(var i=0;i<x.length;i++){ h^=x.charCodeAt(i); h=Math.imul(h,16777619)>>>0; } return h.toString(36)+':'+x.length; }
+  function idx(){ try{ return JSON.parse(localStorage.getItem('dbs_blob_idx')||'{}')||{}; }catch(e){ return {}; } }
+  function idxEcrire(o){ try{ localStorage.setItem('dbs_blob_idx', JSON.stringify(o)); }catch(e){} }
+  var _db=null;
+  function idb(cb){ if(_db) return cb(_db);
+    try{ var rq=indexedDB.open('pilotpro_blobs',1);
+      rq.onupgradeneeded=function(){ try{ rq.result.createObjectStore('b'); }catch(e){} };
+      rq.onsuccess=function(){ _db=rq.result; cb(_db); };
+      rq.onerror=function(){ cb(null); };
+    }catch(e){ cb(null); }
+  }
+  function idbPut(k,v){ idb(function(d){ if(!d)return; try{ d.transaction('b','readwrite').objectStore('b').put(v,k); }catch(e){} }); }
+  function idbDel(k){ idb(function(d){ if(!d)return; try{ d.transaction('b','readwrite').objectStore('b').delete(k); }catch(e){} }); }
+  function idbTout(cb){ idb(function(d){ if(!d) return cb({});
+    try{ var st=d.transaction('b','readonly').objectStore('b'); var out={};
+      var rq=st.openCursor();
+      rq.onsuccess=function(){ var c=rq.result; if(c){ out[c.key]=c.value; c["continue"](); } else cb(out); };
+      rq.onerror=function(){ cb(out); };
+    }catch(e){ cb({}); } }); }
+  /* file d'envoi vers le serveur, avec reprise (hors-ligne, redémarrage…) */
+  var aEnvoyer={}, pompeEnCours=false;
+  function envoyer(k,v,ts){ aEnvoyer[k]={v:v,ts:ts||Date.now()}; pomper(); }
+  async function pomper(){
+    if(pompeEnCours||!actif) return; pompeEnCours=true;
+    var erreur=false;
+    try{
+      /* on vide la file JUSQU'AU BOUT (y compris ce qui arrive pendant l'envoi) ;
+         le délai de 15 s n'est utilisé qu'en cas de panne réseau */
+      for(var tour=0; tour<50 && !erreur; tour++){
+        var ks=Object.keys(aEnvoyer); if(!ks.length) break;
+        var fait=0;
+        for(var i=0;i<ks.length;i++){ var k=ks[i], it=aEnvoyer[k]; if(!it) continue;
+          try{
+            var r=await fetch('/api/blob',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({k:k,v:it.v,ts:it.ts})});
+            var d=await r.json();
+            if(d&&d.ok){
+              if(aEnvoyer[k]===it) delete aEnvoyer[k];
+              if(it.v!=null&&!d.ignore){ var oo=idx(); if(oo[k]==null){ oo[k]={h:h32b(it.v),ts:it.ts}; idxEcrire(oo); } }
+              fait++;
+            }
+          }catch(e){ erreur=true; break; }
+        }
+        if(!fait) break;
+      }
+    }finally{ pompeEnCours=false; }
+    if(Object.keys(aEnvoyer).length) setTimeout(pomper, erreur?15000:400);
+  }
+  var _recents={};   /* fichiers ajoutés récemment sur CE poste : jamais purgés par une vieille synchro */
+  function _e(v){ return (v&&typeof v==='object')?v:{h:String(v||''),ts:0}; }  /* compat ancien format */
+  function set(k,v){ MEM[k]=v; _recents[k]=Date.now(); idbPut(k,v);
+    var o=idx(); o[k]={h:h32b(v),ts:Date.now()}; idxEcrire(o); envoyer(k,v); }
+  function del(k){ delete MEM[k]; idbDel(k); var o=idx(); delete o[k]; idxEcrire(o);
+    /* pierre tombale : la suppression ne « ressuscite » jamais via un autre poste */
+    try{ if(typeof DB!=='undefined'&&DB._tombLoad){ var t=DB._tombLoad(); t.push({k:'blob',id:k,ts:Date.now()}); DB._tombSave(t); } }catch(e){}
+    envoyer(k,null); }
+  function get(k){ return MEM[k]; }
+  function map(prefix){ var out={}; Object.keys(MEM).forEach(function(k){ if(k.indexOf(prefix)===0) out[k.slice(prefix.length)]=MEM[k]; }); return out; }
+  function syncMap(prefix,obj){
+    Object.keys(obj||{}).forEach(function(sfx){ var k=prefix+sfx; if(MEM[k]!==obj[sfx]) set(k,obj[sfx]); });
+    Object.keys(MEM).forEach(function(k){ if(k.indexOf(prefix)===0 && (obj||{})[k.slice(prefix.length)]==null) del(k); });
+  }
+  function attendre(maxMs){ return new Promise(function(res){ var t0=Date.now();
+    (function boucle(){ if(!Object.keys(aEnvoyer).length||Date.now()-t0>(maxMs||10000)) return res();
+      pomper(); setTimeout(boucle,400); })(); }); }
+  /* réconciliation : l'index synchronisé dit ce qui doit exister — on télécharge
+     ce qui manque, on retire ce qui a été supprimé ailleurs, on renvoie au
+     serveur ce qu'il aurait perdu. */
+  var _recTimer=null, _recRun=false;
+  function reconcilier(){ if(_recTimer) clearTimeout(_recTimer); _recTimer=setTimeout(_reconcilier,600); }
+  async function _reconcilier(){
+    if(_recRun||!actif) return; _recRun=true;
+    var changement=false;
+    try{
+      var o=idx();
+      var manque=Object.keys(o).filter(function(k){ return MEM[k]==null||h32b(MEM[k])!==_e(o[k]).h; });
+      for(var i=0;i<manque.length;i++){ var k=manque[i];
+        try{ var r=await fetch('/api/blob?k='+encodeURIComponent(k),{cache:'no-store'}); var d=await r.json();
+          if(d&&d.ok&&d.v!=null){ MEM[k]=d.v; idbPut(k,d.v); changement=true; }
+        }catch(e){ break; }
+      }
+      Object.keys(MEM).forEach(function(k){
+        if(o[k]==null && aEnvoyer[k]===undefined && (Date.now()-(_recents[k]||0))>120000){ delete MEM[k]; idbDel(k); changement=true; }
+      });
+      try{ var ri=await fetch('/api/blobs',{cache:'no-store'}); var di=await ri.json();
+        if(di&&di.ok&&di.idx){
+          /* pierres tombales : un fichier supprimé ailleurs ne doit JAMAIS être
+             ré-envoyé au serveur par un poste qui n'a pas encore reçu la nouvelle */
+          var tb={};
+          try{ if(typeof DB!=='undefined'&&DB._tombLoad) DB._tombLoad().forEach(function(t){ if(t&&t.k==='blob'&&(tb[t.id]==null||t.ts>tb[t.id])) tb[t.id]=t.ts||0; }); }catch(e){}
+          Object.keys(o).forEach(function(k){
+            if(MEM[k]==null) return;
+            if(tb[k]!=null && tb[k]>=(_e(o[k]).ts||0)) return;   /* supprimé plus récemment : silence */
+            if(di.idx[k]!==_e(o[k]).h) envoyer(k,MEM[k],_e(o[k]).ts||1);
+          });
+        }
+      }catch(e){}
+    }catch(e){}
+    _recRun=false;
+    if(changement){
+      try{ if(typeof loadPhotos==='function') loadPhotos(); }catch(e){}
+      try{ _dtPJ=null; }catch(e){}
+      try{ if(window.ppSoftRefresh) window.ppSoftRefresh(false,'fichiers reçus'); }catch(e){}
+    }
+  }
+  var prete=false;
+  function init(){
+    idbTout(function(tout){
+      MEM=tout||{}; prete=true;
+      /* MIGRATION : les photos et pièces jointes SORTENT du stockage qui saturait */
+      try{ var ph=localStorage.getItem('dbs_cmd_photos');
+        if(ph){ var m=JSON.parse(ph)||{}; Object.keys(m).forEach(function(id){ if(MEM['ph:'+id]==null) set('ph:'+id,m[id]); }); localStorage.removeItem('dbs_cmd_photos'); } }catch(e){}
+      try{ var pj=localStorage.getItem('dbs_prepa_pj');
+        if(pj){ var mp=JSON.parse(pj)||{}; Object.keys(mp).forEach(function(oid){ if(MEM['pj:'+oid]==null&&(mp[oid]||[]).length) set('pj:'+oid,JSON.stringify(mp[oid])); }); localStorage.removeItem('dbs_prepa_pj'); } }catch(e){}
+      try{ if(typeof loadPhotos==='function') loadPhotos(); }catch(e){}
+      try{ _dtPJ=null; }catch(e){}
+      try{ if(typeof qcMigrerPhotos==='function') qcMigrerPhotos(); }catch(e){}
+      reconcilier();
+      try{ if(window.ppSoftRefresh) window.ppSoftRefresh(false,'fichiers chargés'); }catch(e){}
+    });
+  }
+  if(document.readyState!=='loading') setTimeout(init,0);
+  else document.addEventListener('DOMContentLoaded',function(){ setTimeout(init,0); });
+  return { get:get, set:set, del:del, map:map, syncMap:syncMap, reconcilier:reconcilier,
+           attendre:attendre, prete:function(){return prete;},
+           tout:function(){ var o={}; Object.keys(MEM).forEach(function(k){ o[k]=MEM[k]; }); return o; } };
+})();
+
+/* ═══════════════════════════════════════════════════════════
+   PPPRES — PRÉSENCE EN DIRECT
+   Qui est connecté, sur quel module, sur quelle fiche — pour ne
+   jamais se marcher dessus quand 5 personnes travaillent ensemble.
+═══════════════════════════════════════════════════════════ */
+var PPPRES=(function(){
+  var actif=(location.protocol==='http:'||location.protocol==='https:')&&!/(\?|&)(atelier|secours|sup)/.test(location.search);
+  var LISTE=[]; var _timer=null; var _derFiche=null, _derMod=null;
+  function posteId(){
+    try{ var p=localStorage.getItem('pp_poste_id');
+      if(!p){ p='P'+Math.random().toString(36).slice(2,8); localStorage.setItem('pp_poste_id',p); }
+      return p; }catch(e){ return 'P?'; }
+  }
+  function envoyer(){
+    if(!actif) return;
+    try{
+      if(!(typeof CURRENT_USER!=='undefined'&&CURRENT_USER)) return;
+      var corps={ poste:posteId(), u:CURRENT_USER.name||CURRENT_USER.login||'?',
+                  mod:(typeof currentPage!=='undefined'?currentPage:''), fiche:window._presFiche||null };
+      fetch('/api/presence',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(corps)})
+        .then(function(r){return r.json();}).then(function(d){ if(d&&d.presence) recevoir(d.presence); }).catch(function(){});
+    }catch(e){}
+  }
+  function recevoir(liste){
+    LISTE=liste||[];
+    peindre();
+    verifierFiche();
+  }
+  function nomModule(m){
+    try{ if(typeof PAGE_TITLES!=='undefined'&&PAGE_TITLES[m]) return PAGE_TITLES[m].t||m; }catch(e){}
+    return m||'';
+  }
+  function autres(){
+    var moi=posteId();
+    return LISTE.filter(function(x){ return x&&x.u&&(x.mod||x.fiche)&&(x.postCle!==moi); });
+  }
+  function peindre(){
+    try{
+      var ind=document.getElementById('pp-sync-ind'); if(!ind) return;
+      var el=document.getElementById('pp-presence');
+      if(!el){ el=document.createElement('div'); el.id='pp-presence';
+        el.style.cssText='font-size:10.5px;color:#94a3b8;padding:4px 10px 6px;line-height:1.55;cursor:default';
+        ind.parentNode.insertBefore(el, ind.nextSibling); }
+      var moi=posteId();
+      var lst=LISTE.filter(function(x){ return x&&x.u; });
+      if(!lst.length){ el.innerHTML=''; return; }
+      el.innerHTML='👥 <b style="color:#cbd5e1">'+lst.length+' en ligne</b><br>'+
+        lst.slice(0,8).map(function(x){
+          var fiche=x.fiche?(' · fiche '+esc(String(x.fiche))):'';
+          return '<span style="color:#7dd3fc">'+esc(x.u)+'</span> <span style="opacity:.75">('+esc(nomModule(x.mod))+fiche+')</span>';
+        }).join('<br>');
+    }catch(e){}
+  }
+  var _avertis={};
+  function verifierFiche(){
+    try{
+      if(!window._presFiche) return;
+      var moi=posteId();
+      var conflit=LISTE.filter(function(x){ return x&&x.fiche===String(window._presFiche)&&x.poste!==moi&&x.u!==((CURRENT_USER||{}).name); });
+      if(conflit.length){
+        var cle=window._presFiche+'·'+conflit[0].u;
+        if(!_avertis[cle]||Date.now()-_avertis[cle]>120000){
+          _avertis[cle]=Date.now();
+          try{ toast('⚠️ '+conflit[0].u+' est aussi sur cette fiche — attention aux modifications croisées','err'); }catch(e){}
+        }
+        /* bandeau dans la fenêtre ouverte */
+        var m=document.getElementById('active-modal');
+        if(m&&!m.querySelector('.pp-pres-avert')){
+          var b=document.createElement('div'); b.className='pp-pres-avert';
+          b.style.cssText='background:#7c2d12;color:#fff;font-size:12px;font-weight:700;padding:7px 12px;border-radius:8px;margin:0 0 10px';
+          b.textContent='⚠️ '+conflit.map(function(c){return c.u;}).join(', ')+' consulte aussi cette fiche en ce moment';
+          var corps=m.querySelector('.modal-body')||m.firstElementChild||m;
+          corps.insertBefore(b, corps.firstChild);
+        }
+      }
+    }catch(e){}
+  }
+  function fiche(id){
+    window._presFiche=(id==null?null:String(id));
+    envoyer();                      /* signal immédiat */
+    if(id!=null) setTimeout(verifierFiche,300);
+  }
+  function demarrer(){
+    if(_timer) clearInterval(_timer);
+    _timer=setInterval(envoyer,10000);
+    envoyer();
+  }
+  if(document.readyState!=='loading') setTimeout(demarrer,1200);
+  else document.addEventListener('DOMContentLoaded',function(){ setTimeout(demarrer,1200); });
+  return { recevoir:recevoir, fiche:fiche, envoyer:envoyer, liste:function(){return LISTE;} };
+})();
+
 const DB_KEY = 'pilotpro_v2';
 const DB_VERSION = 2;
 
@@ -3504,7 +3843,7 @@ function ppQuotaAlert(sentToServer){
     b.innerHTML='⛔ STOCKAGE DU NAVIGATEUR PLEIN — '+(sentToServer
       ?'vos modifications sont envoyées directement au serveur : attendez la pastille VERTE en bas à gauche avant de fermer ou recharger.'
       :'vos dernières modifications NE SONT PAS enregistrées !')
-      +' Pour libérer de la place : supprimez des photos (Contrôle Qualité, commandes) ou d\'anciennes inspections.';
+      +' Rechargez la page : le grand nettoyage automatique (photos migrées vers le serveur) libérera la place.';
   }catch(e){}
   try{ if(typeof toast==='function') toast('Stockage plein — libérez de la place (photos)','err'); }catch(e){}
 }
@@ -3548,7 +3887,10 @@ const DB = {
   },
   load(){
     try{
-      const raw = localStorage.getItem(DB_KEY);
+      /* stockage plein : la dernière valeur vraie vit en mémoire (PPSYNC._ovr) —
+         c'est ELLE que l'écran doit lire, sinon la saisie semble « revenir en arrière » */
+      var ov=(window.PPSYNC&&PPSYNC._ovr&&PPSYNC._ovr[DB_KEY])||null;
+      const raw = ov || localStorage.getItem(DB_KEY);
       if(raw){ this.data = JSON.parse(raw); }
     }catch(e){ console.warn('load failed', e); }
     if(!this.data){ this.data = this.seed(); this.migrate(); this._batir(); this.save(); }
@@ -3568,8 +3910,17 @@ const DB = {
     }
     catch(e){
       console.error('save failed', e);
-      /* Stockage plein : le travail part DIRECTEMENT au serveur depuis la mémoire
-         (le poste le récupérera au prochain démarrage), et l'utilisateur est prévenu. */
+      /* Stockage plein : on libère d'abord les copies dispensables et on réessaie */
+      try{ localStorage.removeItem('pp_preseed_backup'); }catch(_){}
+      try{ localStorage.removeItem('pp_sync_base'); }catch(_){}
+      try{
+        localStorage.setItem(DB_KEY, payload);
+        try{ if(window.PPSYNC&&PPSYNC._clearOverride) PPSYNC._clearOverride(DB_KEY); }catch(_){}
+        var b2=document.getElementById('pp-quota-banner'); if(b2) b2.remove();
+        return;
+      }catch(_){}
+      /* toujours plein : le travail part DIRECTEMENT au serveur depuis la mémoire
+         (et l'écran lit cette mémoire — la saisie ne « revient » plus en arrière) */
       var sent=false;
       try{ if(window.PPSYNC&&PPSYNC.overrideKey&&payload){ PPSYNC.overrideKey(DB_KEY, payload); sent=true; } }catch(_){}
       ppQuotaAlert(sent);
@@ -3709,10 +4060,38 @@ function canAccess(id){
   return !!(p && p[id]);
 }
 
-function doLogin(){
+/* ✨ SÉCURITÉ v5.7 — les mots de passe ne sont PLUS stockés en clair.
+   Chaque mot de passe est haché (SHA-256, salé par l'identifiant) : même en
+   ouvrant les outils du navigateur ou la base, on ne peut plus les lire.
+   Migration automatique au premier passage d'un administrateur. */
+async function ppHash(login,pass){
+  try{
+    const data=new TextEncoder().encode('pp1·'+String(login||'').toUpperCase()+'·'+String(pass||''));
+    const h=await crypto.subtle.digest('SHA-256',data);
+    return 'sha256:'+[...new Uint8Array(h)].map(b=>b.toString(16).padStart(2,'0')).join('');
+  }catch(e){ return null; } /* contexte non sécurisé (http simple) : repli en clair */
+}
+async function ppMigrerMotsDePasse(){
+  try{
+    if(!(CURRENT_USER&&(CURRENT_USER.role==='admin'||CURRENT_USER.role==='resp'))) return;
+    let n=0;
+    for(const u of (ds.users||[])){
+      if(u.pass&&String(u.pass).indexOf('sha256:')!==0){
+        const h=await ppHash(u.login,u.pass);
+        if(h){ u.pass=h; n++; }
+      }
+    }
+    if(n){ DB.save(); console.log('[sécurité] '+n+' mot(s) de passe haché(s)'); }
+  }catch(e){}
+}
+async function doLogin(){
   const u = document.getElementById('login-user').value.trim();
   const p = document.getElementById('login-pass').value;
-  const user = (ds.users||[]).find(x=>x.login===u && x.pass===p);
+  let user = (ds.users||[]).find(x=>x.login===u && x.pass===p);           /* héritage : encore en clair */
+  if(!user){
+    const h=await ppHash(u,p);
+    if(h) user=(ds.users||[]).find(x=>x.login===u && x.pass===h);
+  }
   if(!user){
     document.getElementById('login-err').style.display='block';
     return;
@@ -3721,6 +4100,7 @@ function doLogin(){
   loadActivity(); logAct('connexion','');
   sessionStorage.setItem('pp_user', JSON.stringify({id:user.id}));
   startApp();
+  setTimeout(ppMigrerMotsDePasse, 4000);
 }
 function logout(){
   if(!confirm('Se déconnecter ?')) return;
@@ -4006,7 +4386,8 @@ function openModal(title, bodyHTML, footHTML){
     (footHTML?'<div class="modal-foot">'+footHTML+'</div>':'')+
     '</div></div>';
 }
-function closeModal(){ const m=document.getElementById('modals-mount'); m.innerHTML=''; }
+function closeModal(){ const m=document.getElementById('modals-mount'); m.innerHTML='';
+  try{ if(window.PPPRES) PPPRES.fiche(null); }catch(e){} }
 
 /* CSV export helper */
 function exportCSV(filename, headers, rows){
@@ -4207,6 +4588,7 @@ window.ppSoftRefresh=function(boot, raison){
 function _psrAppliquer(boot, raison){
   try{
     ds=DB.load();                                   /* relit les données reçues */
+    try{ if(window.PPBLOB) PPBLOB.reconcilier(); }catch(e){}   /* photos/PJ : télécharge ce qui manque */
     try{ loadActivity(); }catch(e){}
     try{ if(typeof _dtPJ!=='undefined') _dtPJ=null; }catch(e){}
     try{ refreshRoles(); }catch(e){}
@@ -4258,7 +4640,10 @@ function _psrAppliquer(boot, raison){
       _psrReposer(pg, memo);
     }
     _psrEnAttente=false;
-    try{ toast('🔄 Données mises à jour','ok'); }catch(e){}
+    try{
+      var _n=Date.now();
+      if(!window._ppToastMaj||_n-window._ppToastMaj>180000){ window._ppToastMaj=_n; toast('🔄 Données mises à jour','ok'); }
+    }catch(e){}
   }catch(e){
     _psrEnAttente=false;
     console.error('[mise à jour à chaud]',e);
@@ -5311,8 +5696,15 @@ function renderActivityLog(){
 function exportActivity(){ const head=['Date','Utilisateur','Login','Role','Type','Detail']; const rows=ACTIVITY.slice().reverse().map(e=>[new Date(e.ts).toLocaleString('fr-FR'),e.name,e.login,e.role,e.action,e.detail]); const csv=[head].concat(rows).map(r=>r.map(v=>'"'+String(v==null?'':v).replace(/"/g,'""')+'"').join(';')).join('\n'); const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob(['\ufeff'+csv],{type:'text/csv;charset=utf-8'})); a.download='journal_activite_DBS_'+new Date().toISOString().split('T')[0]+'.csv'; a.click(); }
 function clearActivity(){ if(!CURRENT_USER||CURRENT_USER.role!=='admin'){ toast('R\u00e9serv\u00e9 \u00e0 l\u0027admin','err'); return; } if(confirm('Vider tout le journal d\u0027activit\u00e9 ? Action irr\u00e9versible.')){ ACTIVITY=[]; saveActivity(); renderActivityLog(); toast('Journal vid\u00e9','ok'); } }
 let PHOTOS={};
-function loadPhotos(){ try{ const d=localStorage.getItem("dbs_cmd_photos"); if(d) PHOTOS=JSON.parse(d); }catch(e){ PHOTOS={}; } }
-function savePhotos(){ try{ localStorage.setItem("dbs_cmd_photos",JSON.stringify(PHOTOS)); return true; }catch(e){ toast("Stockage plein \u2014 photo non enregistr\u00e9e","err"); return false; } }
+function loadPhotos(){
+  try{ PHOTOS=(window.PPBLOB&&PPBLOB.prete())?PPBLOB.map('ph:'):PHOTOS||{}; }catch(e){ PHOTOS=PHOTOS||{}; }
+  /* héritage : la migration PPBLOB n'a pas encore tourné sur ce poste */
+  try{ if(!Object.keys(PHOTOS).length){ const d=localStorage.getItem("dbs_cmd_photos"); if(d) PHOTOS=JSON.parse(d)||{}; } }catch(e){}
+}
+function savePhotos(){
+  try{ PPBLOB.syncMap('ph:', PHOTOS); return true; }
+  catch(e){ toast("Photo non enregistr\u00e9e — r\u00e9essayez","err"); return false; }
+}
 function cmdImgSize(){ return parseInt(localStorage.getItem("dbs_cmd_img_size"))||46; }
 function cmdSetImgSize(px){ localStorage.setItem("dbs_cmd_img_size",px); MODULES.commandes.render(); }
 function cmdThumb(o){ const ph=PHOTOS[o.id]; const s=cmdImgSize();
@@ -5360,6 +5752,7 @@ function delPhoto(id){ delete PHOTOS[id]; savePhotos(); if(typeof logAct==="func
 function maybePurgePhoto(o){ try{ if(o && PHOTOS[o.id] && (o.statut==='archived' || biz.autoStatut(o)==='livree')){ delete PHOTOS[o.id]; savePhotos(); } }catch(e){} }
 function purgeOldPhotos(){ try{ let ch=false; Object.keys(PHOTOS).forEach(k=>{ const o=ds.orders.find(x=>String(x.id)===String(k)); if(!o || o.statut==='archived' || biz.autoStatut(o)==='livree'){ delete PHOTOS[k]; ch=true; } }); if(ch) savePhotos(); }catch(e){} }
 function editCmd(id){
+  try{ if(window.PPPRES) PPPRES.fiche(id!=null?('cmd-'+id):null); }catch(e){}
   const o = id?ds.orders.find(x=>x.id===id):{};
   _tailles = (o.tailles&&o.tailles.length)?o.tailles.map(t=>({taille:t.taille,qte:t.qte})):TAILLE_GRIDS.standard.map(t=>({taille:t,qte:0}));
   const ofNum = o.of_number || biz.genOF(); if(!o.of_number) ds.nextOfNum--; // rollback preview
@@ -5863,7 +6256,9 @@ function ouvrieresEnProd(){
   out.sort(function(a,b){return String(a.nom||'').localeCompare(String(b.nom||''));});
   return out;
 }
-function _portalBase(){ var b=(location.origin&&location.origin!=='null')?(location.origin+location.pathname):'https://dbs-pilotpro-production.up.railway.app/'; if(ds.portalBase) b=ds.portalBase; return b; }
+function _portalBase(){ var b=(location.origin&&location.origin!=='null')?(location.origin+location.pathname):'https://dbs-pilotpro-production.up.railway.app/'; if(ds.portalBase) b=ds.portalBase;
+  try{ var tk=localStorage.getItem('pp_api_token'); if(tk) b+=(b.indexOf('?')>-1?'&':'?')+'t='+encodeURIComponent(tk); }catch(e){}
+  return b; }
 function _portalUrl(matricule){ var b=_portalBase(); return b+(b.indexOf('?')>-1?'&':'?')+'rend='+encodeURIComponent(matricule); }
 function _ouvMatricule(o){ if(ds.ouvMat&&ds.ouvMat[o.id])return ds.ouvMat[o.id]; var S=_gpaoS(); if(S){ var pp=(S.personnel||[]).find(function(x){return _norm(x.nom)===_norm(o.nom);}); if(pp)return pp.matricule; } return ''; }
 function _ouvQrKey(o){ return (o.nom&&String(o.nom).trim())?String(o.nom).trim():('O'+o.id); }
@@ -7926,7 +8321,7 @@ function qcEditorHTML(){
       '<td class="r" style="font-weight:800;color:'+(e.ec===null?'var(--slate)':e.hors?'#b42318':'#1b7a3d')+'">'+(e.ec===null?'—':(e.ec>0?'+':'')+e.ec)+(e.hors?' ⚠':'')+'</td>'+
       '<td class="r"><button class="btn sm danger" onclick="qcDelMes('+idx+')">✕</button></td></tr>';
   }).join('');
-  const photosGen=(i.photosGen||[]).map((p,pi)=>'<span style="position:relative;display:inline-block;margin:3px"><img src="'+p+'" style="height:76px;border-radius:8px;border:1px solid var(--line)"><button onclick="qcDelGenPhoto('+pi+')" style="position:absolute;top:-6px;right:-6px;background:#b42318;color:#fff;border:none;border-radius:50%;width:19px;height:19px;font-size:10px;cursor:pointer">✕</button></span>').join('');
+  const photosGen=(i.photosGen||[]).map((p,pi)=>'<span style="position:relative;display:inline-block;margin:3px"><img src="'+qcPhoto(p)+'" style="height:76px;border-radius:8px;border:1px solid var(--line)"><button onclick="qcDelGenPhoto('+pi+')" style="position:absolute;top:-6px;right:-6px;background:#b42318;color:#fff;border:none;border-radius:50%;width:19px;height:19px;font-size:10px;cursor:pointer">✕</button></span>').join('');
   const rcInfo=(i.recontroleDe?'<span style="background:#f3e8ff;color:#6d28d9;font-size:11px;font-weight:800;padding:3px 10px;border-radius:10px">🔁 Re-contrôle de QC-'+String(i.recontroleDe).padStart(3,'0')+'</span> ':'')
     +(i.recontroleId?'<span style="background:#eef2ff;color:#4338ca;font-size:11px;font-weight:800;padding:3px 10px;border-radius:10px">→ Re-contrôlé par QC-'+String(i.recontroleId).padStart(3,'0')+'</span> ':'')
     +(i.qrqcId?'<span style="background:#fdecea;color:#b42318;font-size:11px;font-weight:800;padding:3px 10px;border-radius:10px">🔍 QRQC #'+i.qrqcId+'</span>':'');
@@ -8025,12 +8420,30 @@ function qcLoadBareme(){
 function qcAddDefect(fam){ const i=qcGet(QC_EDIT); if(!i)return; i.defects.push({fam,desc:'',grav:'majeur',n:1,photos:[]}); DB.save(); MODULES.qc.render(); }
 function qcUpdDefect(idx,f,v){ const i=qcGet(QC_EDIT); if(!i||!i.defects[idx])return; i.defects[idx][f]=f==='n'?(parseInt(v,10)||1):v; DB.save(); if(f!=='desc') MODULES.qc.render(); }
 function qcDelDefect(idx){ const i=qcGet(QC_EDIT); if(!i)return; i.defects.splice(idx,1); DB.save(); MODULES.qc.render(); }
-function qcAddDefPhoto(idx){ qcPickPhoto(url=>{ const i=qcGet(QC_EDIT); if(!i||!i.defects[idx])return; (i.defects[idx].photos=i.defects[idx].photos||[]).push(url); DB.save(); MODULES.qc.render(); toast('Photo ajoutée','ok'); }); }
+/* ✨ Les photos d'inspection vivent dans le MAGASIN DE FICHIERS serveur, la fiche
+   ne garde qu'une référence légère (qcb:…) : la base des commandes ne grossit plus
+   avec les images, et le nombre d'inspections n'est plus limité. */
+function qcPhoto(p){ if(!p) return ''; if(String(p).indexOf('qcb:')===0) return (window.PPBLOB&&PPBLOB.get(p))||''; return p; }
+function qcPhotoStore(url){
+  try{ if(window.PPBLOB){ var k='qcb:'+Date.now().toString(36)+Math.random().toString(36).slice(2,8); PPBLOB.set(k,url); return k; } }catch(e){}
+  return url;
+}
+function qcMigrerPhotos(){
+  var ch=false;
+  try{
+    (ds.qcInspections||[]).forEach(function(i){
+      if(Array.isArray(i.photosGen)) i.photosGen=i.photosGen.map(function(p){ if(p&&String(p).indexOf('data:')===0){ ch=true; return qcPhotoStore(p); } return p; });
+      (i.defects||[]).forEach(function(d){ if(Array.isArray(d.photos)) d.photos=d.photos.map(function(p){ if(p&&String(p).indexOf('data:')===0){ ch=true; return qcPhotoStore(p); } return p; }); });
+    });
+  }catch(e){}
+  if(ch){ try{ DB.save(); }catch(e){} }
+}
+function qcAddDefPhoto(idx){ qcPickPhoto(url=>{ const i=qcGet(QC_EDIT); if(!i||!i.defects[idx])return; (i.defects[idx].photos=i.defects[idx].photos||[]).push(qcPhotoStore(url)); DB.save(); MODULES.qc.render(); toast('Photo ajoutée','ok'); }); }
 function qcDelDefPhoto(idx,pi){ const i=qcGet(QC_EDIT); if(!i)return; i.defects[idx].photos.splice(pi,1); DB.save(); MODULES.qc.render(); }
 function qcAddMes(){ const i=qcGet(QC_EDIT); if(!i)return; i.mesures.push({point:'',taille:'',spec:'',tol:'1',mesure:''}); DB.save(); MODULES.qc.render(); }
 function qcUpdMes(idx,f,v){ const i=qcGet(QC_EDIT); if(!i||!i.mesures[idx])return; i.mesures[idx][f]=v; DB.save(); MODULES.qc.render(); }
 function qcDelMes(idx){ const i=qcGet(QC_EDIT); if(!i)return; i.mesures.splice(idx,1); DB.save(); MODULES.qc.render(); }
-function qcAddGenPhoto(){ qcPickPhoto(url=>{ const i=qcGet(QC_EDIT); if(!i)return; (i.photosGen=i.photosGen||[]).push(url); DB.save(); MODULES.qc.render(); toast('Photo ajoutée','ok'); }); }
+function qcAddGenPhoto(){ qcPickPhoto(url=>{ const i=qcGet(QC_EDIT); if(!i)return; (i.photosGen=i.photosGen||[]).push(qcPhotoStore(url)); DB.save(); MODULES.qc.render(); toast('Photo ajoutée','ok'); }); }
 function qcDelGenPhoto(pi){ const i=qcGet(QC_EDIT); if(!i)return; i.photosGen.splice(pi,1); DB.save(); MODULES.qc.render(); }
 
 function qcCloture(id){
@@ -8069,7 +8482,7 @@ function qcReportDoc(i,type){
   const gravCol={critique:'#b42318',majeur:'#b45309',mineur:'#64748b'};
   let defRows='';
   (i.defects||[]).forEach(d=>{
-    const photos=(d.photos||[]).map(p=>'<img src="'+p+'" style="height:88px;border-radius:4px;border:1px solid #ddd;margin:2px">').join('');
+    const photos=(d.photos||[]).map(p=>'<img src="'+qcPhoto(p)+'" style="height:88px;border-radius:4px;border:1px solid #ddd;margin:2px">').join('');
     defRows+='<tr><td>'+esc(d.fam)+'</td><td>'+esc(d.desc||'—')+'</td>'+
       '<td style="text-align:center;font-weight:800;color:'+gravCol[d.grav]+'">'+gravLbl[d.grav]+'</td>'+
       '<td style="text-align:center;font-weight:800">'+(d.n||1)+'</td>'+
@@ -8084,7 +8497,7 @@ function qcReportDoc(i,type){
       '<td class="num">'+esc(m.spec||'')+'</td><td class="num">±'+esc(m.tol||'0')+'</td><td class="num" style="font-weight:700">'+esc(m.mesure||'')+'</td>'+
       '<td class="num" style="font-weight:800;color:'+(e.ec===null?'#999':e.hors?'#b42318':'#1b7a3d')+'">'+(e.ec===null?'—':(e.ec>0?'+':'')+e.ec)+'</td></tr>';
   });
-  const photosGen=(i.photosGen||[]).map(p=>'<img src="'+p+'" style="height:120px;border-radius:5px;border:1px solid #ddd;margin:3px">').join('');
+  const photosGen=(i.photosGen||[]).map(p=>'<img src="'+qcPhoto(p)+'" style="height:120px;border-radius:5px;border:1px solid #ddd;margin:3px">').join('');
   const titre=isClient?'RAPPORT DE CONTRÔLE QUALITÉ — PRODUITS FINIS':'RETOUR QUALITÉ FAÇONNIER — ACTIONS CORRECTIVES';
   const rcNote=i.recontroleDe?'<div style="font-size:10px;color:#6d28d9;font-weight:700;margin-top:3px">🔁 Re-contrôle du rapport QC-'+String(i.recontroleDe).padStart(3,'0')+'</div>':'';
   return '<!DOCTYPE html><html><head><meta charset="utf-8"><title>'+titre+' '+esc(i.of||'')+'</title><style>*{-webkit-print-color-adjust:exact!important;print-color-adjust:exact!important}'
@@ -8573,18 +8986,27 @@ const DT_PJ_KEY='dbs_prepa_pj';
 let _dtPJ=null;
 function dtPJStore(){
   if(_dtPJ) return _dtPJ;
-  try{ var r=localStorage.getItem(DT_PJ_KEY); _dtPJ=r?JSON.parse(r):{}; }catch(e){ _dtPJ={}; }
+  _dtPJ={};
+  try{ var m=(window.PPBLOB&&PPBLOB.prete())?PPBLOB.map('pj:'):{};
+    Object.keys(m).forEach(function(oid){ try{ _dtPJ[oid]=JSON.parse(m[oid])||[]; }catch(e){} });
+  }catch(e){}
+  /* héritage : la migration PPBLOB n'a pas encore tourné */
+  try{ var r=localStorage.getItem(DT_PJ_KEY);
+    if(r){ var old=JSON.parse(r)||{}; Object.keys(old).forEach(function(oid){ if(!_dtPJ[oid]) _dtPJ[oid]=old[oid]; }); }
+  }catch(e){}
   if(!_dtPJ||typeof _dtPJ!=='object'||Array.isArray(_dtPJ)) _dtPJ={};
   return _dtPJ;
 }
 function dtPJSave(){
   try{
-    localStorage.setItem(DT_PJ_KEY, JSON.stringify(dtPJStore()));
-    try{ if(window.PPSYNC&&PPSYNC.markDirty) PPSYNC.markDirty(); }catch(e){}
+    var st=dtPJStore(), m={};
+    Object.keys(st).forEach(function(oid){ if((st[oid]||[]).length) m[oid]=JSON.stringify(st[oid]); });
+    PPBLOB.syncMap('pj:', m);
+    try{ localStorage.removeItem(DT_PJ_KEY); }catch(e){}
     return true;
   }catch(e){
-    console.error('[prépa] quota pièces jointes',e);
-    toast('Stockage plein — pièce jointe non enregistrée. Supprimez d\'anciennes photos.','err');
+    console.error('[prépa] pièces jointes',e);
+    toast('Pièce jointe non enregistrée — réessayez','err');
     return false;
   }
 }
@@ -8949,6 +9371,7 @@ function dtPeindreFiche(cfg){
 }
 
 function dtOuvrir(ecran,id){
+  try{ if(window.PPPRES) PPPRES.fiche(id!=null?('cmd-'+id):null); }catch(e){}
   var E=dtEtat(ecran);
   E.open=(E.open===id?null:id); E.scroll=(E.open!=null);
   var m=MODULES[ecran]; if(m&&m.render) m.render();
@@ -9977,13 +10400,16 @@ function editUser(id){
     '</div>'+(isAdmin?'<p style="font-size:11px;color:var(--ink-3);margin-top:6px">Le compte admin garde toujours son identifiant et son rôle.</p>':''),
     '<button class="btn pri" onclick="saveUser('+(id||0)+')">Enregistrer</button><button class="btn" onclick="closeModal()">Annuler</button>');
 }
-function saveUser(id){
+async function saveUser(id){
   const login=document.getElementById('f-us-login').value.trim();
-  const pass=document.getElementById('f-us-pass').value;
+  const passClair=document.getElementById('f-us-pass').value;
   const name=document.getElementById('f-us-name').value.trim();
   const role=document.getElementById('f-us-role').value;
-  if(!login||!pass||!name){toast('Tous les champs sont requis','err');return;}
+  if(!login||!passClair||!name){toast('Tous les champs sont requis','err');return;}
   if(!id && (ds.users||[]).some(x=>x.login===login)){toast('Cet identifiant existe déjà','err');return;}
+  /* ✨ jamais de mot de passe en clair dans la base : haché dès la création */
+  let pass=passClair;
+  if(String(passClair).indexOf('sha256:')!==0){ const h=await ppHash(login,passClair); if(h) pass=h; }
   if(id){ const u=ds.users.find(x=>x.id===id); if(u.login==='admin'){u.pass=pass;u.name=name;} else Object.assign(u,{login,pass,name,role}); }
   else { const nid=Math.max(0,...(ds.users||[]).map(u=>u.id))+1; ds.users.push({id:nid,login,pass,name,role}); }
   logAct('compte',(id?'modification':'création')+' compte '+login+' ('+name+')');
@@ -10029,9 +10455,10 @@ function reimportFact(){
   if(typeof nav==='function')nav('stats');
 }
 function backupData(auto){
-  const KEYS=['pilotpro_v2','dbs_overrides_2026','dbs_couts_articles_2026','dbs_deleted_2026','dbs_paiements_2026','dbs_comptes_bancaires','dbs_activity_log','dbs_cmd_photos','dbs_prepa_pj','dbs_gpao_prod_v2','dbs_grandlivre_2026_v2','dbs_taux_eur','dbs_tombstones'];
+  const KEYS=['pilotpro_v2','dbs_overrides_2026','dbs_couts_articles_2026','dbs_deleted_2026','dbs_paiements_2026','dbs_comptes_bancaires','dbs_activity_log','dbs_blob_idx','dbs_gpao_prod_v2','dbs_grandlivre_2026_v2','dbs_taux_eur','dbs_tombstones'];
   const keys={}; KEYS.forEach(k=>{ const v=localStorage.getItem(k); if(v!=null) keys[k]=v; });
   const backup={_app:'PilotPro',_version:2,_type:'global',_date:new Date().toISOString(),keys:keys};
+  try{ if(window.PPBLOB){ const bl=PPBLOB.tout(); if(Object.keys(bl).length) backup.blobs=bl; } }catch(e){}
   const a=document.createElement('a');
   a.href=URL.createObjectURL(new Blob([JSON.stringify(backup,null,2)],{type:'application/json'}));
   a.download='PilotPro_sauvegarde_'+(auto?'auto_':'complete_')+todayISO()+'.json'; a.click();
@@ -10052,7 +10479,7 @@ function backupData(auto){
    La restauration est désormais une opération ATOMIQUE, confirmée par le serveur,
    suivie d'un rechargement AUTOMATIQUE. Un seul import suffit.
 ═══════════════════════════════════════════════════════════════════════════════ */
-const RESTORE_NOMS={pilotpro_v2:'Données principales',dbs_overrides_2026:'Facturation',dbs_couts_articles_2026:'Coûts/marges',dbs_deleted_2026:'Suppressions',dbs_paiements_2026:'Paiements',dbs_comptes_bancaires:'Comptes bancaires',dbs_activity_log:'Journal d\'activité',dbs_cmd_photos:'Photos des commandes',dbs_prepa_pj:'Pièces jointes préparation',dbs_gpao_prod_v2:'GPAO Production',dbs_grandlivre_2026_v2:'Grand Livre',dbs_taux_eur:'Taux EUR',dbs_tombstones:'Suppressions (pierres tombales)'};
+const RESTORE_NOMS={pilotpro_v2:'Données principales',dbs_overrides_2026:'Facturation',dbs_couts_articles_2026:'Coûts/marges',dbs_deleted_2026:'Suppressions',dbs_paiements_2026:'Paiements',dbs_comptes_bancaires:'Comptes bancaires',dbs_activity_log:'Journal d\'activité',dbs_cmd_photos:'Photos des commandes',dbs_prepa_pj:'Pièces jointes préparation',dbs_gpao_prod_v2:'GPAO Production',dbs_grandlivre_2026_v2:'Grand Livre',dbs_taux_eur:'Taux EUR',dbs_tombstones:'Suppressions (pierres tombales)',dbs_blob_idx:'Index des fichiers (photos)'};
 
 function restoreData(input){
   const f=input.files[0]; if(!f){return;}
@@ -10068,7 +10495,7 @@ function restoreData(input){
     if(!(data&&data.keys&&typeof data.keys==='object')){ toast('Format de sauvegarde non reconnu','err'); input.value=''; return; }
 
     /* ── Contrôle du contenu AVANT d'écrire quoi que ce soit ── */
-    const KEYS=(window.PPSYNC&&PPSYNC._KEYS)||['pilotpro_v2','dbs_overrides_2026','dbs_couts_articles_2026','dbs_deleted_2026','dbs_paiements_2026','dbs_comptes_bancaires','dbs_activity_log','dbs_cmd_photos','dbs_prepa_pj','dbs_gpao_prod_v2','dbs_grandlivre_2026_v2','dbs_taux_eur','dbs_tombstones'];
+    const KEYS=(window.PPSYNC&&PPSYNC._KEYS)||['pilotpro_v2','dbs_overrides_2026','dbs_couts_articles_2026','dbs_deleted_2026','dbs_paiements_2026','dbs_comptes_bancaires','dbs_activity_log','dbs_blob_idx','dbs_gpao_prod_v2','dbs_grandlivre_2026_v2','dbs_taux_eur','dbs_tombstones'];
     const valides={}; const invalides=[]; const modsOk=[];
     KEYS.forEach(k=>{ if(data.keys[k]==null) return;
       try{ if(k!=='dbs_taux_eur') JSON.parse(data.keys[k]); valides[k]=data.keys[k]; modsOk.push(RESTORE_NOMS[k]||k); }
@@ -10089,6 +10516,19 @@ function restoreData(input){
       +'Les données du SERVEUR et de TOUS les postes seront remplacées par cette sauvegarde.\n\n'
       +'Continuer ?';
     if(!confirm(msg)) return;
+
+    /* ── Fichiers (photos, pièces jointes) ── */
+    try{
+      if(window.PPBLOB){
+        if(data.blobs&&typeof data.blobs==='object'){
+          PPBLOB.syncMap('', data.blobs);              /* remplacement complet du magasin */
+        } else {
+          /* ancienne sauvegarde : photos/PJ encore dans keys → on les migre */
+          try{ var phL=data.keys['dbs_cmd_photos']; if(phL){ var mL=JSON.parse(phL)||{}; Object.keys(mL).forEach(function(id){ PPBLOB.set('ph:'+id,mL[id]); }); } }catch(e){}
+          try{ var pjL=data.keys['dbs_prepa_pj']; if(pjL){ var mpL=JSON.parse(pjL)||{}; Object.keys(mpL).forEach(function(oid){ if((mpL[oid]||[]).length) PPBLOB.set('pj:'+oid,JSON.stringify(mpL[oid])); }); } }catch(e){}
+        }
+      }
+    }catch(e){}
 
     /* ── Opération atomique ── */
     openModal('⏳ Restauration en cours…',
@@ -10122,7 +10562,7 @@ function restoreData(input){
       '<button class="btn pri" onclick="location.reload()">Recharger maintenant</button>');
     /* Rechargement automatique : la mémoire de la page ne doit JAMAIS survivre à une
        restauration, sinon elle réécrit l'ancien état au premier enregistrement. */
-    if(okSrv) setTimeout(()=>location.reload(), 1500);
+    if(okSrv){ try{ await (window.PPBLOB?PPBLOB.attendre(9000):Promise.resolve()); }catch(e){} setTimeout(()=>location.reload(), 800); }
   };
   r.readAsText(f);
 }
@@ -10443,7 +10883,7 @@ if(document.readyState!=='loading'){ askName(); load().then(listScreen); }
 /* ═══════ MODE SECOURS (?secours) — sauvetage & restauration des données ═══════ */
 (function(){
 if(!/(\?|&)secours/.test(location.search)) return;
-var KEYS=['pilotpro_v2','dbs_overrides_2026','dbs_couts_articles_2026','dbs_deleted_2026','dbs_paiements_2026','dbs_comptes_bancaires','dbs_activity_log','dbs_cmd_photos','dbs_prepa_pj','dbs_gpao_prod_v2','dbs_grandlivre_2026_v2','dbs_taux_eur','dbs_tombstones'];
+var KEYS=['pilotpro_v2','dbs_overrides_2026','dbs_couts_articles_2026','dbs_deleted_2026','dbs_paiements_2026','dbs_comptes_bancaires','dbs_activity_log','dbs_blob_idx','dbs_gpao_prod_v2','dbs_grandlivre_2026_v2','dbs_taux_eur','dbs_tombstones'];
 function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
 function snap(){ var o={}; KEYS.forEach(function(k){ var v=localStorage.getItem(k); if(v!=null) o[k]=v; }); return o; }
 function fmtDT(ts){ try{ return new Date(ts).toLocaleString('fr-FR'); }catch(e){ return String(ts); } }
