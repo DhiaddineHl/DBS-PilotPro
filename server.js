@@ -81,6 +81,13 @@ const FileStorage = {
   async getRev() { return this.loadState().rev || 0; },
   async saveState(keys, ts) {
     const cur = this.loadState();
+    /* ✨ v6.3 — même garde qu'en PostgreSQL : un état vide ne remplace jamais
+       une base pleine (protection anti-écrasement, mode fichier compris). */
+    if ((!keys || !Object.keys(keys).length) && cur.keys && Object.keys(cur.keys).length) {
+      console.warn('[GARDE] état vide reçu → aucune écriture (révision inchangée : ' + (cur.rev || 0) + ')');
+      const e = new Error('état vide refusé (protection anti-écrasement)');
+      e.etatVide = true; e.rev = cur.rev || 0; throw e;
+    }
     hourlyBackup(cur);
     const next = { keys: keys || {}, rev: (cur.rev || 0) + 1, ts: +ts || Date.now(), updatedAt: new Date().toISOString() };
     this._save(next);
@@ -99,15 +106,37 @@ function makePgStorage(dburl) {
   const { PgStore } = require('./pgstore');
   const db = new Client(dburl);
   const store = new PgStore(db);
-  let ready = store.init().then(() => { console.log('  PostgreSQL : schéma prêt.'); })
-    .catch(e => { console.error('  PostgreSQL init:', e.message); throw e; });
+  /* ✨ v6.5 — DÉMARRAGE RÉSILIENT : si PostgreSQL n'est pas encore joignable
+     (déploiement Railway, base qui redémarre), le serveur NE MEURT PLUS. Il
+     démarre, sert l'application, répond 503 explicite sur les données, et
+     réessaie en boucle jusqu'à ce que la base réponde. */
+  let pret = false;
+  let ready = null;
+  function preparer() {
+    if (pret) return Promise.resolve();
+    if (ready) return ready;
+    ready = store.init()
+      .then(() => { pret = true; ready = null; console.log('  PostgreSQL : schéma prêt.'); })
+      .catch(e => {
+        ready = null;
+        console.error('  PostgreSQL indisponible (' + String(e && e.message || e).slice(0, 90) + ') — nouvelle tentative dans 3 s');
+        const err = new Error('PostgreSQL indisponible : ' + String(e && e.message || e).slice(0, 120));
+        err.indisponible = true;
+        throw err;
+      });
+    return ready;
+  }
+  /* tentatives de connexion en tâche de fond, sans jamais bloquer le démarrage */
+  (function boucle() {
+    preparer().catch(() => { setTimeout(boucle, 3000); });
+  })();
   let lastBackupHour = '';
   return {
     _db: db, _store: store,
-    async loadState() { await ready; return store.loadState(); },
-    async getRev() { await ready; return store.getRev(); },
+    async loadState() { await preparer(); return store.loadState(); },
+    async getRev() { await preparer(); return store.getRev(); },
     async saveState(keys, ts) {
-      await ready;
+      await preparer();
       // Sauvegarde best-effort : au plus une fois par heure (évite de relire l'état à chaque POST)
       const hk = hourStamp(new Date());
       if (hk !== lastBackupHour) {
@@ -128,13 +157,13 @@ function makePgStorage(dburl) {
       return { rev: r.rev, ts: +ts || Date.now(), updatedAt: new Date().toISOString() };
     },
     async restore(bk, name) {
-      await ready;
+      await preparer();
       const r = await store.saveState(bk.keys || {}, Date.now());
       logAudit('backup_restored', { name, newRev: r.rev });
       return { rev: r.rev };
     },
-    async listTables() { await ready; return store.listTables(); },
-    async readTable(n) { await ready; return store.readTable(n); }
+    async listTables() { await preparer(); return store.listTables(); },
+    async readTable(n) { await preparer(); return store.readTable(n); }
   };
 }
 
@@ -255,6 +284,55 @@ setInterval(() => {
    Les compteurs (nextOfNum…) prennent le MAXIMUM des deux côtés :
    plus de numéros d'OF réutilisés après une divergence.
    ════════════════════════════════════════════════════════════════ */
+/* fusion fine d'une fiche : la récente impose ses champs, les sous-tableaux
+   de fiches sont unis par id (l'élément de la récente gagne à id égal) */
+function _fusionFiche(ancienne, recente) {
+  const out = Object.assign({}, ancienne, recente);
+  Object.keys(ancienne).forEach(ch => {
+    const a = ancienne[ch], r = recente[ch];
+    if (_estTableauFiches(a) && _estTableauFiches(r)) {
+      const par = {}; const ordre = [];
+      a.forEach(x => { if (par[x.id] == null) ordre.push(x.id); par[x.id] = x; });
+      r.forEach(x => { if (par[x.id] == null) ordre.push(x.id); par[x.id] = x; });
+      out[ch] = ordre.map(id => par[id]);
+    }
+  });
+  return out;
+}
+/* ═══ NORMALISATION D'ENTRÉE (v6.3) ═══
+   Point de passage OBLIGÉ avant toute écriture, quel que soit le chemin
+   (synchro, restauration, envoi forcé) et quel que soit le stockage
+   (PostgreSQL ou fichier). Garantit que la vérité verbatim et les
+   projections pp_* sont construites à partir des MÊMES données : aucune
+   divergence possible entre les deux représentations. */
+function normaliserEtat(keys) {
+  const out = {}; const trace = [];
+  Object.keys(keys || {}).forEach(k => {
+    const brut = keys[k];
+    let obj;
+    try { obj = JSON.parse(brut); } catch (e) { out[k] = brut; return; }   /* non-JSON : intact */
+    let touche = false;
+    const nettoyer = (arr, chemin) => {
+      const avant = arr.length; const net = _dedoublonner(arr);
+      if (net.length !== avant) { touche = true; trace.push({ cle: k, champ: chemin, avant, apres: net.length }); }
+      return net;
+    };
+    if (_estTableauFiches(obj)) obj = nettoyer(obj, '(racine)');
+    else if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+      Object.keys(obj).forEach(ch => { if (_estTableauFiches(obj[ch])) obj[ch] = nettoyer(obj[ch], ch); });
+    }
+    out[k] = touche ? JSON.stringify(obj) : brut;      /* inchangé → octets d'origine préservés */
+  });
+  return { keys: out, trace };
+}
+function _dedoublonner(arr) {
+  const vu = {}; const out = [];
+  arr.forEach(r => {
+    if (vu[r.id] == null) { vu[r.id] = out.length; out.push(r); }
+    else if ((r._ts || 0) >= (out[vu[r.id]]._ts || 0)) out[vu[r.id]] = r;
+  });
+  return out;
+}
 function _estTableauFiches(v) {
   return Array.isArray(v) && v.every(x => x && typeof x === 'object' && !Array.isArray(x) && x.id != null);
 }
@@ -276,12 +354,25 @@ function _tombIndex(keysA, keysB) {
 function _fusionTableau(champ, srvArr, inArr, tombs, detail, horizon) {
   const parId = {};
   const ordre = [];
-  let retirees = 0;
+  let retirees = 0; const dupIds = [];
   inArr.forEach(r => {
     const tomb = tombs[champ + ' ' + r.id] || 0;
     if (tomb > (r._ts || 0)) { retirees++; return; } /* supprimée ailleurs, plus récemment : ne ressuscite pas */
+    if (parId[r.id] != null) {
+      /* ✨ v6.1 : DOUBLON dans l'envoi (même id deux fois) — on garde la plus
+         récente, jamais deux lignes (l'erreur PostgreSQL 21000 venait de là).
+         v6.3 : et on le TRACE (table, clé, ids, versions retenues). */
+      dupIds.push(r.id);
+      if ((r._ts || 0) >= (parId[r.id]._ts || 0)) parId[r.id] = r;
+      return;
+    }
     parId[r.id] = r; ordre.push(r.id);
   });
+  if (dupIds.length) {
+    console.warn('[SYNC DEDUP · étage 1 fusion] table=' + champ + ' cle_conflit=id doublons=' + dupIds.length
+      + ' ids=' + dupIds.slice(0, 10).join(',') + ' lot=' + inArr.length + '→' + ordre.length);
+    try { logAudit('dedup', { etage: 'fusion', table: champ, cle: 'id', doublons: dupIds.length, ids: dupIds.slice(0, 10), lot: inArr.length, retenu: ordre.length }); } catch (e) {}
+  }
   let sauvees = 0; const exemples = [];
   /* fiches du poste retirées car supprimées plus récemment ailleurs */
   const idsServeur = {}; srvArr.forEach(s => { idsServeur[s.id] = 1; });
@@ -296,7 +387,10 @@ function _fusionTableau(champ, srvArr, inArr, tombs, detail, horizon) {
   srvArr.forEach(s => {
     const kk = champ + ' ' + s.id;
     if (parId[s.id] != null) {
-      /* présente des deux côtés : la plus récente gagne ; égalité → le poste (actif) */
+      /* présente des deux côtés : la plus récente gagne ; égalité → le poste (actif).
+         (Les modifications simultanées de la MÊME fiche par deux postes sont
+         réconciliées par la fusion trois-voies côté poste + la garde de révision
+         409 ; la présence en direct avertit avant la collision.) */
       if ((s._ts || 0) > (parId[s.id]._ts || 0)) parId[s.id] = s;
       return;
     }
@@ -332,6 +426,8 @@ function mergeAutorite(serverKeys, inKeys) {
           R[ch] = _fusionTableau(ch, sv, iv, tombs, detail, horizon);
         } else if (_estTableauFiches(sv) && iv == null) {
           R[ch] = sv;                                  /* tableau absent de la photo : conservé */
+        } else if (_estTableauFiches(iv) && sv == null) {
+          R[ch] = _dedoublonner(iv);                   /* nouveau tableau : dédoublonné par sécurité */
         } else if (/^next/i.test(ch) && typeof sv === 'number' && typeof iv === 'number') {
           R[ch] = Math.max(sv, iv);                    /* compteurs : jamais en arrière */
         }
@@ -530,7 +626,30 @@ const server = http.createServer((req, res) => {
   if (url === '/api/state' && req.method === 'GET') {
     Promise.resolve(storage.loadState())
       .then(s => { try { s.h = empreinteEtat(s); } catch (e) {} json(res, 200, s); })
-      .catch(e => json(res, 500, { keys: {}, rev: 0, ts: 0, error: String(e) }));
+      .catch(e => {
+        /* ✨ v6.2 : une PANNE de lecture n'est jamais déguisée en « serveur vide »
+           (rev 0 sans erreur poussait les postes à se croire pionniers).
+           Le poste reçoit une erreur EXPLICITE et attend. */
+        logAudit('read_error', { error: String(e && e.message || e).slice(0, 300) });
+        json(res, 503, { ok: false, indisponible: 1, error: 'PostgreSQL: ' + String(e && e.message || e).slice(0, 200), keys: null, rev: -1 });
+      });
+    return;
+  }
+
+  /* ───── ✨ État du pool de connexions PostgreSQL ───── */
+  if (url === '/api/pool' && req.method === 'GET') {
+    if (!usePg) { json(res, 200, { ok: true, backend: 'file' }); return; }
+    try { json(res, 200, { ok: true, pool: storage._db.etat() }); }
+    catch (e) { json(res, 500, { ok: false, error: String(e && e.message || e) }); }
+    return;
+  }
+
+  /* ───── ✨ Autocontrôle de cohérence (vérité verbatim ⇄ projections) ───── */
+  if (url === '/api/coherence' && req.method === 'GET') {
+    if (!usePg) { json(res, 200, { ok: true, backend: 'file', note: 'mode fichier : une seule représentation, cohérence par construction' }); return; }
+    storage._store.verifierCoherence()
+      .then(r => { if (!r.ok) logAudit('coherence_ecart', { rev: r.rev, sceau: r.sceau, ecarts: r.ecarts.slice(0, 10) }); json(res, 200, r); })
+      .catch(e => json(res, 500, { ok: false, error: String(e && e.message || e) }));
     return;
   }
 
@@ -626,6 +745,13 @@ const server = http.createServer((req, res) => {
             }
           } catch (e) { logAudit('merge_error', { error: String(e && e.message || e) }); }
         }
+        /* ✨ passage obligé : une seule source normalisée pour les deux représentations */
+        const norm = normaliserEtat(toSave);
+        toSave = norm.keys;
+        if (norm.trace.length) {
+          console.warn('[SYNC DEDUP · entrée] ' + norm.trace.map(t => t.cle + '.' + t.champ + ' ' + t.avant + '→' + t.apres).join(' | '));
+          logAudit('dedup', { etage: 'entree', detail: norm.trace.slice(0, 10), restore: !!incoming.restore, force: !!incoming.force });
+        }
         const saved = await storage.saveState(toSave, incoming.ts);
         logAudit('state_update', { newRev: saved.rev, itemsBefore, itemsAfter, rescued: rescueInfo ? rescueInfo.rescued : 0, stateSizeBytes: body.length, backend: usePg ? 'postgres' : 'file', ip: (req.socket && req.socket.remoteAddress) || '' });
         /* Des fiches ont été sauvées → l'état serveur diffère de la photo envoyée :
@@ -633,7 +759,15 @@ const server = http.createServer((req, res) => {
         if (rescueInfo) json(res, 200, { ok: true, rev: saved.rev, ts: saved.ts, rescued: rescueInfo.rescued, keys: toSave });
         else json(res, 200, { ok: true, rev: saved.rev, ts: saved.ts });
         sseBroadcast(saved.rev, !!incoming.restore); /* ✨ prévient tous les postes en ~1 s */
-      } catch (e) { json(res, 400, { ok: false, error: String(e && e.message || e) }); }
+      } catch (e) {
+        if (e && e.etatVide) {
+          logAudit('empty_rejected', { rev: e.rev, ip: (req.socket && req.socket.remoteAddress) || '' });
+          json(res, 409, { ok: false, etatVide: 1, rev: e.rev, error: 'état vide refusé — les données du serveur sont intactes' });
+          return;
+        }
+        logAudit('write_error', { error: String(e && e.message || e).slice(0, 300), table: e.syncTable || '', dups: e.syncDups || [] });
+        json(res, 500, { ok: false, error: String(e && e.message || e).slice(0, 300), table: e.syncTable || undefined });
+      }
     });
     return;
   }
@@ -734,7 +868,7 @@ const server = http.createServer((req, res) => {
         if (!bk) { json(res, 404, { ok: false, error: 'instantané introuvable' }); return; }
         /* horizon : les postes en retard ne réinjecteront pas ce que cette
            restauration retire volontairement */
-        bk.keys = Object.assign({}, bk.keys, { pp_restore_horizon: String(Date.now()) });
+        bk.keys = normaliserEtat(Object.assign({}, bk.keys, { pp_restore_horizon: String(Date.now()) })).keys;
         const r = await storage.restore(bk, name);
         logAudit('backup_restored', { name, newRev: r.rev });
         json(res, 200, { ok: true, rev: r.rev });
@@ -782,6 +916,7 @@ server.listen(PORT, () => {
   console.log('');
   console.log('  Stockage :         ' + (usePg ? 'PostgreSQL (structuré par module) ✨' : 'Fichier ' + STATE));
   if (usePg) console.log('  Lecture modules :  /api/db  et  /api/db/<table>  (pour l\'app DBS)');
+  if (usePg) { try { console.log('  Pool PostgreSQL :  ' + storage._db.etat().max + ' connexions max · une transaction = une connexion dédiée'); } catch (e) {} }
   console.log('  Sauvegardes :      ' + BKDIR + '  (horaires + quotidiennes)');
   console.log('  Audit :            ' + AUDIT + '  (lecture: /api/audit)');
   console.log('  Compression :      gzip activée sur toutes les réponses');

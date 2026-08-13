@@ -3152,8 +3152,25 @@ var PPSYNC=(function(){
         } else { schedule(); return; }
         S.conflict=true; S.state='conflict';
       }
-      else { S.state='err'; S.err=(pd&&pd.error)||'réponse invalide'; if(pd&&pd.auth){ try{ window.ppCleDemander(); }catch(e){} } }
-    }catch(e){ S.state='off'; S.err='serveur injoignable'; }
+      else {
+        S.state='err'; S.err=(pd&&pd.error)||'réponse invalide';
+        if(pd&&pd.auth){ try{ window.ppCleDemander(); }catch(e){} }
+        /* ✨ v6.2 : REPRISE CONTRÔLÉE — jamais de rafale sur un serveur en erreur.
+           Attente croissante : 5 s, 15 s, 60 s, puis toutes les 2 min. */
+        S.echecs=(S.echecs||0)+1;
+        var attente=[5000,15000,60000][Math.min(S.echecs-1,2)]||120000;
+        if(S.timer) clearTimeout(S.timer);
+        S.timer=setTimeout(function(){ push(); }, attente);
+        paint(); return;
+      }
+      S.echecs=0;
+    }catch(e){
+      S.state='off'; S.err='serveur injoignable';
+      S.echecs=(S.echecs||0)+1;
+      var att2=[5000,15000,60000][Math.min(S.echecs-1,2)]||120000;
+      if(S.timer) clearTimeout(S.timer);
+      S.timer=setTimeout(function(){ push(); }, att2);
+    }
     paint();
   }
 
@@ -3193,6 +3210,13 @@ var PPSYNC=(function(){
     try{
       var r=await fetch('/api/state',{cache:'no-store'}); var d=await r.json();
       if(d&&d.auth){ S.state='err'; S.err='clé d\'accès requise'; try{ window.ppCleDemander(); }catch(e){} finishBoot(opts); paint(); return; }
+      /* ✨ v6.2 : serveur EN PANNE ≠ serveur VIDE. En panne, on attend — on ne
+         devient jamais « pionnier » (ce qui poussait ensuite tout ce poste
+         par-dessus la base au retour du serveur). */
+      if(d&&(d.indisponible||d.error||(typeof d.rev==='number'&&d.rev<0))){
+        S.state='err'; S.err=String(d.error||'serveur en difficulté').slice(0,140);
+        finishBoot(opts); paint(); return;
+      }
       var srvRev=d.rev||0, keys=d.keys||{};
       var srvHas=Object.keys(keys).length>0;
       if(!srvHas){
@@ -3331,9 +3355,19 @@ var PPSYNC=(function(){
       if(d&&d.auth){ el.innerHTML='<div style="color:#b42318;font-size:12px">🔐 Clé d\u0027accès requise — ce poste ne peut pas lire le serveur.</div>'; try{ window.ppCleDemander(); }catch(e){} return; }
       var mine=snap(); var lignes=''; var ecarts=0;
       var noms={pilotpro_v2:'Commandes & données principales',dbs_overrides_2026:'Factures',dbs_couts_articles_2026:'Coûts/marges',dbs_deleted_2026:'Suppressions factures',dbs_paiements_2026:'Encaissements (paiements)',dbs_comptes_bancaires:'Comptes bancaires',dbs_activity_log:'Journal d\u0027activité',dbs_blob_idx:'Index des photos',dbs_gpao_prod_v2:'GPAO Production',dbs_grandlivre_2026_v2:'Grand Livre',dbs_taux_eur:'Taux EUR',dbs_tombstones:'Pierres tombales'};
+      /* comparaison de FOND : PostgreSQL réécrit le texte à sa façon (même contenu,
+         octets différents) — on compare donc les données, pas leur mise en forme */
+      function canon(x){
+        if(Array.isArray(x)) return '['+x.map(canon).join(',')+']';
+        if(x&&typeof x==='object'){ return '{'+Object.keys(x).sort().map(function(kk){ return JSON.stringify(kk)+':'+canon(x[kk]); }).join(',')+'}'; }
+        return JSON.stringify(x);
+      }
+      function pareilFond(a,b){
+        if(a===b) return true;
+        try{ return canon(JSON.parse(a||'null'))===canon(JSON.parse(b||'null')); }catch(e){ return false; }
+      }
       KEYS.forEach(function(k){
-        var l=h32(mine[k]||''), sv=h32((d.keys||{})[k]||'');
-        var ok=(l===sv);
+        var ok=pareilFond(mine[k]||'', (d.keys||{})[k]||'');
         if(!ok) ecarts++;
         lignes+='<div style="display:flex;gap:8px;font-size:11.5px;padding:2px 0">'
           +'<span>'+(ok?'✅':'❌')+'</span><span style="flex:1">'+(noms[k]||k)+'</span>'
@@ -3932,6 +3966,25 @@ const DB = {
       e[k]=cur; });
     if(tombs) this._tombSave(tombs);
   },
+  /* ✨ v6.1 : jamais deux fiches avec le même identifiant — les doublons
+     (hérités d'anciennes fusions) faisaient refuser l'enregistrement par
+     PostgreSQL (erreur 21000) et bloquaient la synchronisation. On garde la
+     version la plus récente. */
+  _depoussierer(){
+    try{
+      var d=this.data||{}, self=this, n=0;
+      Object.keys(d).forEach(function(k){ var v=d[k];
+        if(!self._estFiches(v)) return;
+        var vu={}; var out=[];
+        v.forEach(function(r){
+          if(vu[r.id]==null){ vu[r.id]=out.length; out.push(r); }
+          else { n++; if((r._ts||0)>=(out[vu[r.id]]._ts||0)) out[vu[r.id]]=r; }
+        });
+        if(out.length!==v.length) d[k]=out;
+      });
+      if(n){ console.warn('[nettoyage] '+n+' fiche(s) en double supprimée(s)'); this.save(); }
+    }catch(e){}
+  },
   load(){
     try{
       /* stockage plein : la dernière valeur vraie vit en mémoire (PPSYNC._ovr) —
@@ -3942,6 +3995,7 @@ const DB = {
     }catch(e){ console.warn('load failed', e); }
     if(!this.data){ this.data = this.seed(); this.migrate(); this._batir(); this.save(); }
     this._batir();                                   /* référence fraîche : rien n'est marqué au chargement */
+    try{ if(!this._netFait){ this._netFait=true; this._depoussierer(); } }catch(e){}
     return this.data;
   },
   save(){

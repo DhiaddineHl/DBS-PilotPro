@@ -62,19 +62,24 @@ function decompose(keys) {
   const meta = {};
   const tables = {};
 
+  const proprietaire = {};                       // table → clé d'état qui la produit
+  let _cle = null;
   function extractArray(source, arr) {
     const name = tableFor(source);
     tables[name] = { kind: 'array', rows: arr.map((el, i) => ({ id: String(el.id), ord: i, data: el })) };
+    proprietaire[name] = _cle;
     return { __ref: name, __kind: 'array' };
   }
   function extractDict(source, dict) {
     const name = tableFor(source);
     const ks = Object.keys(dict);
     tables[name] = { kind: 'dict', rows: ks.map((k, i) => ({ id: k, ord: i, data: dict[k] })) };
+    proprietaire[name] = _cle;
     return { __ref: name, __kind: 'dict' };
   }
 
   for (const key of toplevel) {
+    _cle = key;
     let parsed;
     try { parsed = JSON.parse(keys[key]); }
     catch (e) { meta[key] = { __rawString: keys[key] }; continue; }
@@ -95,7 +100,7 @@ function decompose(keys) {
       meta[key] = parsed;                          // scalaire / dict vide / tableau sans id
     }
   }
-  return { toplevel, meta, tables };
+  return { toplevel, meta, tables, proprietaire };
 }
 
 /* ─── RECOMPOSITION ───
@@ -122,7 +127,15 @@ function resolveRefs(node, loadTable) {
    Store : initialise le schéma, écrit (POST) et lit (GET) l'état.
    ════════════════════════════════════════════════════════════════ */
 /* Tables système : jamais purgées par saveState, jamais exposées par readTable */
-const RESERVED_TABLES = new Set(['pp_meta', 'pp_prix_journal']);
+/* comparaison de FOND : l'ordre des champs ne doit pas créer de faux écart */
+function trierProfond(x) {
+  if (Array.isArray(x)) return x.map(trierProfond);
+  if (x && typeof x === 'object') {
+    const o = {}; Object.keys(x).sort().forEach(k => { o[k] = trierProfond(x[k]); }); return o;
+  }
+  return x;
+}
+const RESERVED_TABLES = new Set(['pp_meta', 'pp_prix_journal', 'pp_state', 'pp_blobs', 'pp_snapshots', 'pp_rev_journal']);
 
 class PgStore {
   constructor(db) { this.db = db; this.knownTables = new Set(); }
@@ -147,6 +160,45 @@ class PgStore {
        Railway (le disque du conteneur, lui, est effacé à chaque déploiement). */
     await this.db.query(`CREATE TABLE IF NOT EXISTS pp_snapshots (
       name text PRIMARY KEY, ts bigint, taille int, donnees text)`);
+    /* ✨ v6.2 — VÉRITÉ VERBATIM : l'état est stocké et servi TEL QUEL, octet
+       pour octet (comme le mode fichier). Les tables pp_orders, pp_clients…
+       restent alimentées comme PROJECTION de consultation, mais ne servent
+       plus de source pour /api/state : la recomposition JSONB réordonnait
+       les données et désynchronisait les fusions fines entre postes. */
+    await this.db.query(`CREATE TABLE IF NOT EXISTS pp_state (
+      k text PRIMARY KEY, val text, updated_at timestamptz DEFAULT now())`);
+    /* ✨ v6.5 — JOURNAL DES RÉVISIONS avec CLÉ PRIMAIRE : chaque révision produite
+       y est insérée dans la transaction qui la crée. Si deux transactions
+       calculaient la même révision, la SECONDE serait REJETÉE PAR POSTGRESQL
+       (violation de clé primaire) et annulée : une collision de révision est
+       structurellement impossible, pas seulement improbable. */
+    await this.db.query(`CREATE TABLE IF NOT EXISTS pp_rev_journal (
+      rev bigint PRIMARY KEY, ts timestamptz DEFAULT now(), taille int)`);
+  }
+
+  /* ─── Autocontrôle de cohérence : la vérité verbatim et les projections
+         racontent-elles la même histoire ? (exposé par /api/coherence) ─── */
+  async verifierCoherence() {
+    const rev = await this.getRev();
+    const out = { rev, sceau: null, verbatim: {}, projection: {}, ecarts: [], ok: true };
+    const vr = await this.db.query('SELECT k,val FROM pp_state');
+    const verb = {};
+    vr.rows.forEach(r => { if (r.k === '__rev') out.sceau = parseInt(r.val, 10); else verb[r.k] = r.val; });
+    out.verbatim.cles = Object.keys(verb).length;
+    out.sceauValide = (out.sceau === rev);
+    if (!out.sceauValide) { out.ok = false; out.ecarts.push('sceau ' + out.sceau + ' ≠ révision ' + rev); }
+    /* recomposition indépendante depuis les tables de fiches */
+    const recompose = await this._loadRecompose(rev);
+    out.projection.cles = Object.keys(recompose.keys).length;
+    const canon = (t) => { try { return JSON.stringify(trierProfond(JSON.parse(t))); } catch (e) { return String(t); } };
+    const toutes = new Set([...Object.keys(verb), ...Object.keys(recompose.keys)]);
+    toutes.forEach(k => {
+      const a = verb[k], b = recompose.keys[k];
+      if (a === undefined) { out.ecarts.push(k + ' : absent de la vérité verbatim'); out.ok = false; return; }
+      if (b === undefined) { out.ecarts.push(k + ' : absent des projections'); out.ok = false; return; }
+      if (canon(a) !== canon(b)) { out.ecarts.push(k + ' : contenu différent (verbatim ' + a.length + ' o · projection ' + b.length + ' o)'); out.ok = false; }
+    });
+    return out;
   }
 
   /* ─── Instantanés ─── */
@@ -227,7 +279,35 @@ class PgStore {
 
   /* Lit tout l'état et le renvoie au format attendu par le client. */
   async loadState() {
-    const rev = await this.getRev();
+    /* ✨ v6.3 : révision ET vérité verbatim lues dans la MÊME lecture atomique —
+       un enregistrement concurrent ne peut plus se glisser entre les deux et
+       faire croire à un sceau périmé. */
+    const atomique = await this.db.lecture(async (c) => {
+      const rr = await c.query("SELECT v FROM pp_meta WHERE k='__sys.rev'");
+      const rev = rr.rows.length ? (parseInt(JSON.parse(rr.rows[0].v), 10) || 0) : 0;
+      let rows = [];
+      try { rows = (await c.query('SELECT k,val FROM pp_state')).rows; } catch (e) {}
+      const maj = await c.query("SELECT v FROM pp_meta WHERE k='__sys.updatedAt'");
+      return { rev, rows, updatedAt: maj.rows.length ? JSON.parse(maj.rows[0].v) : null };
+    });
+    const rev = atomique.rev;
+    /* ✨ v6.2 : lecture VERBATIM (octet pour octet), SOUS CONDITION DE SCEAU.
+       La recomposition depuis les tables reste le filet : migration depuis un
+       ancien schéma, ou vérité verbatim périmée (déploiement mixte). */
+    if (atomique.rows.length) {
+      const keys = {}; let sceau = null;
+      atomique.rows.forEach(r => { if (r.k === '__rev') sceau = parseInt(r.val, 10); else keys[r.k] = r.val; });
+      if (sceau === rev && Object.keys(keys).length) {
+        return { keys, rev, ts: rev, updatedAt: atomique.updatedAt };
+      }
+      console.warn('[COHERENCE] vérité verbatim périmée (sceau=' + sceau + ' révision=' + rev
+        + ') → recomposition depuis les tables de fiches');
+    }
+    return await this._loadRecompose(rev);
+  }
+
+  /* Recomposition indépendante depuis les tables de fiches (filet + autocontrôle) */
+  async _loadRecompose(rev) {
     const metaRows = await this.db.query("SELECT k,v FROM pp_meta WHERE k NOT LIKE '__sys.%'");
     const metaMap = {}; metaRows.rows.forEach(r => { metaMap[r.k] = JSON.parse(r.v); });
     const tlRow = await this.db.query("SELECT v FROM pp_meta WHERE k='__sys.toplevel'");
@@ -262,15 +342,38 @@ class PgStore {
   /* Écrit un nouvel état (POST). Transactionnel : tout ou rien.
      Retourne { rev }. */
   async saveState(keys, ts) {
-    const { toplevel, meta, tables } = decompose(keys);
+    /* ✨ v6.3 — GARDE ANTI-DESTRUCTION : un état VIDE n'est jamais destructeur.
+       Il ne peut ni vider les tables de fiches, ni la vérité verbatim, ni les
+       squelettes. On refuse l'opération plutôt que de détruire. */
+    if (!keys || !Object.keys(keys).length) {
+      const revActuelle = await this.getRev();
+      console.warn('[GARDE] état vide reçu → aucune écriture (révision inchangée : ' + revActuelle + ')');
+      const e = new Error('état vide refusé (protection anti-écrasement)');
+      e.etatVide = true; e.rev = revActuelle; throw e;
+    }
+    const { toplevel, meta, tables, proprietaire } = decompose(keys);
     // s'assure que toutes les tables existent AVANT la transaction
     for (const name of Object.keys(tables)) await this._ensureTable(name);
 
     const db = this.db;
     return await db.tx(async (c) => {
-      // 1) compteur de révision
-      const rr = await c.query("SELECT v FROM pp_meta WHERE k='__sys.rev' FOR UPDATE");
-      const rev = (rr.rows.length ? parseInt(JSON.parse(rr.rows[0].v), 10) || 0 : 0) + 1;
+      /* ═══ 1) COMPTEUR DE RÉVISION — ATOMICITÉ GARANTIE PAR POSTGRESQL ═══
+         Le calcul n'est PLUS fait en JavaScript (lecture → +1 → écriture, qui
+         permettait en théorie que deux transactions calculent la même valeur si
+         la ligne compteur manquait). PostgreSQL fait lui-même lecture-incrément-
+         écriture sous verrou de ligne dans UN SEUL ordre UPDATE … RETURNING :
+         une transaction concurrente est mise en attente, puis relit la valeur
+         RÉELLEMENT validée avant d'incrémenter. */
+      await c.query("INSERT INTO pp_meta(k,v) VALUES('__sys.rev','0') ON CONFLICT(k) DO NOTHING");
+      /* le compteur ne peut JAMAIS reculer : il repart au maximum déjà journalisé */
+      await c.query("UPDATE pp_meta SET v = to_jsonb(GREATEST((v#>>'{}')::bigint, COALESCE((SELECT max(rev) FROM pp_rev_journal),0))) WHERE k='__sys.rev'");
+      const rr = await c.query("UPDATE pp_meta SET v = to_jsonb(((v#>>'{}')::bigint + 1)) WHERE k='__sys.rev' RETURNING v");
+      if (!rr.rows.length) throw new Error('compteur de révision introuvable');
+      const rev = parseInt(JSON.parse(rr.rows[0].v), 10);
+      /* filet dur : la clé primaire refuse tout doublon de révision. Une violation
+         ici signifie que deux transactions ont produit le même numéro : la
+         transaction est annulée par PostgreSQL, aucune donnée n'est écrite. */
+      await c.query('INSERT INTO pp_rev_journal(rev, taille) VALUES($1,$2)', [rev, JSON.stringify(keys || {}).length]);
 
       // 2) meta : squelettes + scalaires (on remplace tout l'ensemble meta applicatif)
       await c.query("DELETE FROM pp_meta WHERE k NOT LIKE '__sys.%'");
@@ -280,20 +383,92 @@ class PgStore {
       }
       await c.query("INSERT INTO pp_meta(k,v) VALUES('__sys.toplevel',$1::jsonb) " +
         "ON CONFLICT(k) DO UPDATE SET v=EXCLUDED.v", [JSON.stringify(toplevel)]);
-      await c.query("UPDATE pp_meta SET v=$1::jsonb WHERE k='__sys.rev'", [JSON.stringify(rev)]);
       await c.query("INSERT INTO pp_meta(k,v) VALUES('__sys.updatedAt',$1::jsonb) " +
         "ON CONFLICT(k) DO UPDATE SET v=EXCLUDED.v", [JSON.stringify(new Date().toISOString())]);
+      if (rev % 500 === 0) { try { await c.query('DELETE FROM pp_rev_journal WHERE rev < $1', [rev - 5000]); } catch (e) {} }
+
+      /* ✨ v6.5 — ÉCRITURE DIFFÉRENTIELLE DES PROJECTIONS.
+         Une seule commande modifiée ne doit pas faire réécrire les 560 fiches
+         des 26 tables (GPAO, Grand Livre, journal…). On compare la vérité
+         verbatim déjà stockée : les clés INCHANGÉES gardent leurs tables
+         telles quelles — la connexion est retenue bien moins longtemps. */
+      /* on compare d'abord par EMPREINTE (12 petites lignes) au lieu de rapatrier
+         1,5 Mo à chaque envoi ; le contenu n'est relu que pour les clés modifiées */
+      const emp = {};
+      try { (await c.query('SELECT k, md5(val) h FROM pp_state')).rows.forEach(r => { emp[r.k] = r.h; }); } catch (e) {}
+      const md5 = (v) => require('crypto').createHash('md5').update(String(v)).digest('hex');
+      const inchangees = new Set();
+      Object.keys(keys || {}).forEach(k => { if (emp[k] !== undefined && emp[k] === md5(keys[k])) inchangees.add(k); });
+      const ancien = {};
+      const aRelire = Object.keys(keys || {}).filter(k => !inchangees.has(k) && emp[k] !== undefined);
+      if (aRelire.length) {
+        try { (await c.query('SELECT k,val FROM pp_state WHERE k = ANY(SELECT jsonb_array_elements_text($1::jsonb))', [JSON.stringify(aRelire)]))
+          .rows.forEach(r => { ancien[r.k] = r.val; }); } catch (e) {}
+      }
+      /* Finesse supplémentaire : dans une clé modifiée (pilotpro_v2 contient 13
+         collections), seules les COLLECTIONS réellement touchées sont réécrites.
+         Modifier une commande ne fait plus réécrire clients, chaînes, factures… */
+      const tablesIdentiques = new Set();
+      try {
+        const ancCles = {};
+        Object.keys(keys || {}).forEach(k => { if (!inchangees.has(k) && ancien[k] !== undefined) ancCles[k] = ancien[k]; });
+        if (Object.keys(ancCles).length) {
+          const av = decompose(ancCles);
+          Object.keys(av.tables).forEach(nom => {
+            if (!tables[nom]) return;
+            if (JSON.stringify(av.tables[nom].rows) === JSON.stringify(tables[nom].rows)) tablesIdentiques.add(nom);
+          });
+        }
+      } catch (e) { /* au moindre doute : on réécrit tout (jamais de risque) */ }
+
+      /* ═══ VÉRITÉ VERBATIM — source unique de /api/state ═══
+         Écrite dans LA MÊME transaction que les projections pp_* : les deux
+         représentations ne peuvent pas diverger (tout ou rien). */
+      const clesEtat = Object.keys(keys || {});
+      /* garde : un état vide n'efface jamais la vérité (protection anti-écrasement) */
+      if (clesEtat.length) {
+        await c.query('DELETE FROM pp_state WHERE k <> $1 AND NOT (k = ANY(SELECT jsonb_array_elements_text($2::jsonb)))',
+          ['__rev', JSON.stringify(clesEtat)]);
+        for (const k of clesEtat) {
+          if (inchangees.has(k)) continue;          /* identique : rien à transmettre */
+          await c.query('INSERT INTO pp_state(k,val) VALUES($1,$2) ' +
+            'ON CONFLICT(k) DO UPDATE SET val=EXCLUDED.val, updated_at=now() WHERE pp_state.val IS DISTINCT FROM EXCLUDED.val',
+            [k, String(keys[k])]);
+        }
+        /* ✨ SCEAU DE COHÉRENCE : la vérité verbatim porte le numéro de révision
+           qui l'a produite. Si un serveur d'une AUTRE version écrivait l'état sans
+           mettre à jour pp_state (déploiement mixte, retour arrière), le sceau ne
+           correspondrait plus et la lecture basculerait automatiquement sur la
+           recomposition depuis les tables — jamais de données périmées servies. */
+        await c.query('INSERT INTO pp_state(k,val) VALUES($1,$2) ON CONFLICT(k) DO UPDATE SET val=EXCLUDED.val, updated_at=now()',
+          ['__rev', String(rev)]);
+      }
 
       // 3) tables de fiches : upsert des lignes + suppression des disparues
       const seen = new Set(Object.keys(tables));
+      let tablesEcrites = 0, tablesIgnorees = 0;
       for (const name of Object.keys(tables)) {
-        const rows = tables[name].rows;
+        /* projection appartenant à une clé inchangée → rien à réécrire */
+        if (inchangees.has(proprietaire[name]) || tablesIdentiques.has(name)) { tablesIgnorees++; continue; }
+        tablesEcrites++;
+        /* ✨ v6.1 : ceinture de sécurité — jamais deux lignes avec le même id dans
+           un même envoi (PostgreSQL refuse : erreur 21000). On garde la dernière. */
+        const _vu = new Map(); const _doublons = [];
+        tables[name].rows.forEach(r => { if (_vu.has(String(r.id))) _doublons.push(String(r.id)); _vu.set(String(r.id), r); });
+        const rows = [..._vu.values()];
+        if (_doublons.length) {
+          /* jamais bloquant, mais TOUJOURS journalisé : table, clé, ids, volumes */
+          console.warn('[SYNC DEDUP] table=' + name + ' cle=id doublons=' + _doublons.length
+            + ' ids=' + _doublons.slice(0, 10).join(',') + ' lignes=' + tables[name].rows.length + '→' + rows.length);
+          try { this._journalDedup = (this._journalDedup || []); this._journalDedup.push({ ts: Date.now(), table: name, ids: _doublons.slice(0, 20), avant: tables[name].rows.length, apres: rows.length }); } catch (e) {}
+        }
         const ids = rows.map(r => r.id);
         // supprime ce qui n'existe plus
         await c.query(`DELETE FROM ${name} WHERE NOT (id = ANY(SELECT jsonb_array_elements_text($1::jsonb)))`,
           [JSON.stringify(ids.length ? ids : [])]);
         // upsert par lots (multi-lignes) — ne touche updated_at que si la fiche change
         const CHUNK = 400;
+        try {
         for (let i = 0; i < rows.length; i += CHUNK) {
           const slice = rows.slice(i, i + CHUNK);
           const vals = []; const params = [];
@@ -308,9 +483,25 @@ class PgStore {
             `updated_at=CASE WHEN ${name}.data IS DISTINCT FROM EXCLUDED.data THEN now() ELSE ${name}.updated_at END`,
             params);
         }
+        } catch (e) {
+          /* ✨ v6.2 — DIAGNOSTIC FORENSIQUE : plus jamais d'« Erreur serveur » muette.
+             On journalise la table, la clé de conflit, les doublons éventuels et
+             les identifiants concernés, puis on relance l'erreur (la transaction
+             sera annulée proprement — révision inchangée, aucune donnée perdue). */
+          try {
+            const compte = {}; rows.forEach(r => { compte[r.id] = (compte[r.id] || 0) + 1; });
+            const dups = Object.keys(compte).filter(k => compte[k] > 1);
+            console.error('[SYNC ERROR] table=' + name + ' cle_conflit=id code=' + (e.pgCode || '?')
+              + ' doublons=' + dups.length + ' ids=' + dups.slice(0, 10).join(',')
+              + ' lignes_lot=' + rows.length + ' message=' + String(e.message || e).slice(0, 160));
+            e.syncTable = name; e.syncDups = dups.slice(0, 10);
+          } catch (x) {}
+          throw e;
+        }
       }
       // 4) purge des tables de fiches devenues vides (plus référencées)
       //    — les tables système (journal des prix, meta) ne sont JAMAIS purgées
+      this._derniereEcriture = { rev, tablesEcrites, tablesIgnorees, inchangees: inchangees.size };
       const existing = await c.query(
         "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename LIKE 'pp_%' AND tablename<>'pp_meta'");
       for (const row of existing.rows) {

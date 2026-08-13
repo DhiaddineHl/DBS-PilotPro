@@ -311,40 +311,182 @@ function parseUrl(url) {
 }
 
 /* ─── Petit pool : reconnexion automatique, une connexion réutilisée ─── */
+/* ════════════════════════════════════════════════════════════════════════
+   POOL DE CONNEXIONS POSTGRESQL (v6.4)
+   ────────────────────────────────────────────────────────────────────────
+   RÈGLE ABSOLUE :
+     une transaction = UNE connexion dédiée, du BEGIN jusqu'au
+     COMMIT/ROLLBACK, sans aucune autre requête sur cette connexion.
+
+     Pool
+       ↓  acquisition d'une connexion (exclusive)
+     BEGIN → requêtes de la transaction → COMMIT / ROLLBACK
+       ↓  libération de la connexion
+     La connexion utilisée par la transaction A est INTERDITE à B
+     jusqu'à la fin de A — garanti par construction : tant qu'une
+     connexion est « occupée », le pool ne la redonne à personne.
+
+   Le pool remplace l'ancienne connexion globale unique : les lectures ne
+   sont plus mises en attente derrière les écritures, et une requête ne
+   peut plus jamais s'intercaler dans une transaction ouverte.
+   ════════════════════════════════════════════════════════════════════════ */
 class Client {
-  constructor(cfg) {
+  constructor(cfg, opts) {
     this.cfg = typeof cfg === 'string' ? parseUrl(cfg) : cfg;
-    this.conn = null;
-    this.connectingP = null;
+    const o = opts || {};
+    this.max = Math.max(2, +(o.max || process.env.PG_POOL_MAX || 8));
+    this.attenteMaxMs = +(o.attenteMaxMs || 20000);
+    this.libres = [];            // connexions saines disponibles
+    this.occupees = new Set();   // connexions détenues en exclusivité
+    this.attente = [];           // demandeurs en file (FIFO)
+    this.total = 0;              // connexions ouvertes (libres + occupées)
+    this.stats = { acquisitions: 0, creations: 0, attentes: 0, erreurs: 0, maxOccupees: 0 };
   }
-  async _get() {
-    if (this.conn && this.conn.ready) return this.conn;
-    if (this.connectingP) return this.connectingP;
-    this.connectingP = (async () => {
-      const c = new Connection(this.cfg);
-      c.onErr = () => { if (this.conn === c) { this.conn = null; } };
+
+  async _nouvelle() {
+    /* ✨ la place est RÉSERVÉE avant la connexion : sans cela, deux demandes
+       simultanées voyaient toutes deux « il reste de la place » et le pool
+       dépassait sa limite (constaté : 6 connexions pour un maximum de 5). */
+    this.total++;
+    let c;
+    try {
+      c = new Connection(this.cfg);
+      c.onErr = () => { c.hs = true; this._retirer(c); };
       await c.connect();
-      this.conn = c; this.connectingP = null; return c;
-    })();
-    return this.connectingP;
+    /* filets de sécurité de session : un verrou attend 15 s max (erreur claire
+       plutôt que gel silencieux) ; une transaction laissée ouverte plus de 30 s
+       est annulée par PostgreSQL lui-même (libère les verrous automatiquement) */
+      try { await c.query("SET lock_timeout='15s'"); } catch (e) {}
+      try { await c.query("SET idle_in_transaction_session_timeout='30s'"); } catch (e) {}
+      c.hs = false;
+      this.stats.creations++;
+      return c;
+    } catch (e) {
+      this.total = Math.max(0, this.total - 1);      // place rendue en cas d'échec
+      const suivant = this.attente.shift(); if (suivant) suivant();
+      throw e;
+    }
   }
+  _retirer(c) {
+    this.occupees.delete(c);
+    const i = this.libres.indexOf(c); if (i >= 0) this.libres.splice(i, 1);
+    this.total = Math.max(0, this.total - 1);
+    try { c.end(); } catch (e) {}
+  }
+
+  /* Acquiert une connexion EXCLUSIVE. Tant qu'elle n'est pas libérée,
+     aucun autre appelant ne peut l'obtenir. */
+  async acquerir() {
+    this.stats.acquisitions++;
+    while (true) {
+      const c = this.libres.pop();
+      if (c) {
+        if (!c.ready || c.hs) { this._retirer(c); continue; }   // connexion morte : on en prend une autre
+        this.occupees.add(c);
+        this.stats.maxOccupees = Math.max(this.stats.maxOccupees, this.occupees.size);
+        return c;
+      }
+      if (this.total < this.max) {
+        try {
+          const n = await this._nouvelle();
+          this.occupees.add(n);
+          this.stats.maxOccupees = Math.max(this.stats.maxOccupees, this.occupees.size);
+          return n;
+        } catch (e) { this.stats.erreurs++; throw e; }
+      }
+      /* pool saturé : on attend qu'une connexion soit rendue (jamais indéfiniment) */
+      this.stats.attentes++;
+      await new Promise((resolve, reject) => {
+        const t = setTimeout(() => {
+          const k = this.attente.indexOf(demandeur); if (k >= 0) this.attente.splice(k, 1);
+          reject(new Error('pool PostgreSQL saturé (' + this.max + ' connexions) — délai dépassé'));
+        }, this.attenteMaxMs);
+        const demandeur = () => { clearTimeout(t); resolve(); };
+        this.attente.push(demandeur);
+      });
+    }
+  }
+  /* Rend la connexion au pool. `saine=false` → connexion détruite (jamais réutilisée). */
+  liberer(c, saine) {
+    if (!c) return;
+    this.occupees.delete(c);
+    if (saine === false || !c.ready || c.hs) { this._retirer(c); }
+    else if (this.libres.indexOf(c) < 0) this.libres.push(c);
+    const suivant = this.attente.shift();
+    if (suivant) suivant();
+  }
+
+  /* Requête simple : connexion prise puis IMMÉDIATEMENT rendue. */
   async query(text, params) {
     let lastErr;
-    for (let attempt = 0; attempt < 2; attempt++) {       // 1 reconnexion auto
-      try { const c = await this._get(); return await c.query(text, params); }
+    for (let essai = 0; essai < 2; essai++) {
+      const c = await this.acquerir();
+      try { const r = await c.query(text, params); this.liberer(c, true); return r; }
       catch (e) {
-        lastErr = e; this.conn = null; this.connectingP = null;
-        if (e.pgCode) throw e;                              // erreur SQL réelle : ne pas retenter
+        lastErr = e;
+        /* erreur SQL (contrainte, 21000…) : le protocole reste sain, la
+           connexion RESTE dans le pool. Panne réseau : connexion détruite. */
+        this.liberer(c, !!e.pgCode);
+        if (e.pgCode) throw e;
       }
     }
     throw lastErr;
   }
+
+  /* ═══ TRANSACTION : connexion DÉDIÉE du BEGIN au COMMIT/ROLLBACK ═══ */
   async tx(fn) {
-    await this.query('BEGIN');
-    try { const r = await fn(this); await this.query('COMMIT'); return r; }
-    catch (e) { try { await this.query('ROLLBACK'); } catch (x) {} throw e; }
+    const c = await this.acquerir();
+    const portee = { query: (t, p) => c.query(t, p) };   // toutes les requêtes sur CETTE connexion
+    let saine = true;
+    try {
+      await c.query('BEGIN');
+      let r;
+      try { r = await fn(portee); }
+      catch (e) {
+        try { await c.query('ROLLBACK'); }
+        catch (x) { saine = false; }                     // ROLLBACK impossible : connexion détruite
+        throw e;
+      }
+      await c.query('COMMIT');
+      return r;
+    } catch (e) {
+      if (!e.pgCode) saine = false;                      // panne réseau : ne jamais réutiliser
+      throw e;
+    } finally {
+      this.liberer(c, saine);
+    }
   }
-  end() { if (this.conn) this.conn.end(); }
+
+  /* Lecture ATOMIQUE : instantané cohérent, connexion dédiée, sans blocage
+     des écritures (READ ONLY + REPEATABLE READ). */
+  async lecture(fn) {
+    const c = await this.acquerir();
+    let saine = true;
+    try {
+      await c.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+      try {
+        const r = await fn({ query: (t, p) => c.query(t, p) });
+        await c.query('COMMIT');
+        return r;
+      } catch (e) {
+        try { await c.query('ROLLBACK'); } catch (x) { saine = false; }
+        throw e;
+      }
+    } catch (e) {
+      if (!e.pgCode) saine = false;
+      throw e;
+    } finally { this.liberer(c, saine); }
+  }
+
+  etat() {
+    return { max: this.max, ouvertes: this.total, occupees: this.occupees.size,
+             libres: this.libres.length, enAttente: this.attente.length, stats: this.stats };
+  }
+  end() {
+    this.libres.slice().forEach(c => { try { c.end(); } catch (e) {} });
+    this.occupees.forEach(c => { try { c.end(); } catch (e) {} });
+    this.libres = []; this.occupees.clear(); this.total = 0;
+  }
 }
 
-module.exports = { Client, Connection, parseUrl };
+module.exports = { Client, Pool: Client, Connection, parseUrl };
