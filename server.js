@@ -351,10 +351,55 @@ function _tombIndex(keysA, keysB) {
   });
   return idx;
 }
+/* ═══ ✨ v7.0 · TRANSITIONS MÉTIER IRRÉVERSIBLES ═══
+   Le cycle de vie d'une commande ne recule JAMAIS « tout seul » :
+   active(0) → done(1) → archived(2), et les marques de facturation
+   (facturee, facture_qte) ne s'effacent pas. Un recul n'est accepté que
+   s'il est VOLONTAIRE : l'horodatage du changement de statut (_st_ts,
+   posé par le poste au moment du clic) est strictement plus récent que
+   celui de la copie qui détient l'état avancé. Cette règle est INDÉPENDANTE
+   de la révision globale et de l'horodatage général _ts de la fiche. */
+function _rangStatut(s) { return s === 'archived' ? 2 : s === 'done' ? 1 : 0; }
+function _protegerFiche(gagnant, perdant, champ, gardes) {
+  if (!gagnant || !perdant || gagnant === perdant) return gagnant;
+  var out = null;
+  var gSt = gagnant._st_ts || 0, pSt = perdant._st_ts || 0;
+  /* Le champ STATUT a sa PROPRE version : il appartient au côté qui a fait le
+     dernier changement de statut VOLONTAIRE (_st_ts le plus récent), quel que
+     soit le vainqueur général de la fiche. À égalité (fiches d'époque : 0/0),
+     l'état le plus AVANCÉ gagne — jamais de recul silencieux :
+       ARCHIVÉE → désarchivage volontaire (bouton ↩, _st_ts frais) → ACTIVE   ✔ opération métier
+       ARCHIVÉE → vieille photo locale (aucun _st_ts)              → ACTIVE   ✘ régression interdite */
+  var stOwner = pSt > gSt ? perdant
+              : gSt > pSt ? gagnant
+              : (_rangStatut(gagnant.statut) >= _rangStatut(perdant.statut) ? gagnant : perdant);
+  if (stOwner.statut !== gagnant.statut) {
+    out = Object.assign({}, gagnant);
+    out.statut = stOwner.statut;
+    gardes.push({ champ: champ, id: gagnant.id, protege: 'statut', garde: stOwner.statut, refuse: gagnant.statut });
+  }
+  /* la mémoire du dernier changement volontaire survit à la fusion */
+  if (Math.max(gSt, pSt) > ((out || gagnant)._st_ts || 0)) {
+    out = out || Object.assign({}, gagnant);
+    out._st_ts = Math.max(gSt, pSt);
+  }
+  /* marques de facturation : jamais effacées par une copie qui ne porte pas
+     un changement volontaire plus récent */
+  var volontaire = gSt > pSt;
+  ['facturee', 'facture_qte'].forEach(function (f) {
+    var vP = perdant[f], vG = (out || gagnant)[f];
+    if (vP && !vG && !volontaire) {
+      out = out || Object.assign({}, gagnant);
+      out[f] = vP;
+      gardes.push({ champ: champ, id: gagnant.id, protege: f, garde: vP, refuse: vG === undefined ? 'absent' : vG });
+    }
+  });
+  return out || gagnant;
+}
 function _fusionTableau(champ, srvArr, inArr, tombs, detail, horizon) {
   const parId = {};
   const ordre = [];
-  let retirees = 0; const dupIds = [];
+  let retirees = 0; const dupIds = []; const gardes = []; const bloquees = [];
   inArr.forEach(r => {
     const tomb = tombs[champ + ' ' + r.id] || 0;
     if (tomb > (r._ts || 0)) { retirees++; return; } /* supprimée ailleurs, plus récemment : ne ressuscite pas */
@@ -384,20 +429,49 @@ function _fusionTableau(champ, srvArr, inArr, tombs, detail, horizon) {
       if (r && !idsServeur[id] && (r._ts || 0) < horizon) { delete parId[id]; }
     });
   }
+  /* ✨ v7.0 · ANTI-RÉSURRECTION : sur une base substantielle, une fiche connue
+     SEULEMENT du poste et SANS AUCUN horodatage (_ts ni ts) est forcément une
+     fiche d'époque (antérieure au marquage) que le serveur ne détient plus —
+     donc SUPPRIMÉE côté serveur, avant l'existence des pierres tombales.
+     Elle ne revient pas. Toute création réelle est horodatée à la seconde où
+     elle naît : elle passe toujours. Bloqué = journalisé avec les identifiants. */
+  if (srvArr.length >= 8) {
+    ordre.slice().forEach(id => {
+      const r = parId[id];
+      if (r && !idsServeur[id] && !(r._ts || r.ts)) { delete parId[id]; bloquees.push(r.of_number || r.ref || r.id); }
+    });
+  }
   srvArr.forEach(s => {
     const kk = champ + ' ' + s.id;
     if (parId[s.id] != null) {
-      /* présente des deux côtés : la plus récente gagne ; égalité → le poste (actif).
-         (Les modifications simultanées de la MÊME fiche par deux postes sont
-         réconciliées par la fusion trois-voies côté poste + la garde de révision
-         409 ; la présence en direct avertit avant la collision.) */
-      if ((s._ts || 0) > (parId[s.id]._ts || 0)) parId[s.id] = s;
+      /* présente des deux côtés : la plus récente gagne ; ✨ v7.0 : ÉGALITÉ → LE
+         SERVEUR (les fiches d'époque sans _ts des deux côtés ne permettent plus
+         à une vieille photo d'écraser la vérité commune ; toute saisie réelle
+         d'un poste est horodatée et gagne donc strictement). Puis la GARDE
+         MÉTIER s'applique au vainqueur, quel qu'il soit : le statut ne recule
+         jamais sans _st_ts plus récent, les marques de facturation ne
+         s'effacent pas. */
+      const local = parId[s.id];
+      let vainqueur = ((s._ts || 0) >= (local._ts || 0)) ? s : local;
+      const perdant = (vainqueur === s) ? local : s;
+      vainqueur = _protegerFiche(vainqueur, perdant, champ, gardes);
+      parId[s.id] = vainqueur;
       return;
     }
     if ((tombs[kk] || 0) >= (s._ts || 0) && tombs[kk]) return;   /* vraie suppression du poste */
     parId[s.id] = s; ordre.push(s.id); sauvees++;
     if (exemples.length < 5) exemples.push(s.of_number || s.ref || s.nom || s.id);
   });
+  if (bloquees.length) {
+    console.warn('[GARDE RÉSURRECTION] table=' + champ + ' fiches_bloquees=' + bloquees.length + ' ids=' + bloquees.slice(0, 10).join(','));
+    try { logAudit('resurrection_bloquee', { table: champ, nombre: bloquees.length, ids: bloquees.slice(0, 20) }); } catch (e) {}
+    detail.push({ champ, sauvees: 0, retirees: bloquees.length, exemples: bloquees.slice(0, 5).map(x => 'résurrection bloquée: ' + x) });
+  }
+  if (gardes.length) {
+    console.warn('[GARDE MÉTIER] table=' + champ + ' protections=' + gardes.length + ' ' + gardes.slice(0, 5).map(g => g.id + ':' + g.protege + '=' + g.garde + '≠' + g.refuse).join(' '));
+    try { logAudit('transition_protegee', { table: champ, nombre: gardes.length, detail: gardes.slice(0, 20) }); } catch (e) {}
+    detail.push({ champ, sauvees: gardes.length, retirees: 0, exemples: gardes.slice(0, 5).map(g => (g.id) + ' ' + g.protege + ' conservé: ' + g.garde) });
+  }
   if (sauvees || retirees) detail.push({ champ, sauvees, retirees, exemples });
   return ordre.filter(id => parId[id] != null).map(id => parId[id]);
 }
@@ -436,8 +510,52 @@ function mergeAutorite(serverKeys, inKeys) {
     }
   } catch (e) { /* photo illisible : on garde la photo telle quelle */ }
 
-  /* 2 · tableaux de fiches de premier niveau (journal d'activité, paiements, comptes) */
-  ['dbs_activity_log', 'dbs_paiements_2026', 'dbs_comptes_bancaires'].forEach(k => {
+  /* 2 · ✨ v7.0 · PAIEMENTS : dictionnaire facture → { règlements[], _pts }.
+     Cette clé n'est PAS un tableau de fiches : avant v7.0 elle tombait dans le
+     « le poste gagne en bloc » — une vieille photo effaçait un encaissement et
+     une facture PAYÉE redevenait EN ATTENTE. Désormais : fusion PAR FACTURE.
+     · entrée d'un seul côté → conservée (sauf pierre tombale plus récente) ;
+     · les deux côtés, _pts (horodatage de l'entrée) différent → la plus récente
+       gagne — une photo d'époque sans _pts ne bat jamais le serveur ;
+     · égalité (données historiques) → UNION des règlements par identifiant :
+       un paiement encaissé ne disparaît JAMAIS tout seul. Les suppressions
+       volontaires de règlements passent par des pierres tombales dédiées. */
+  try {
+    const svP = JSON.parse(serverKeys['dbs_paiements_2026'] || 'null');
+    const ivP = JSON.parse(inKeys['dbs_paiements_2026'] || 'null');
+    if (svP && ivP && typeof svP === 'object' && typeof ivP === 'object' && !Array.isArray(svP) && !Array.isArray(ivP)) {
+      const R = {}; const gardesP = [];
+      new Set(Object.keys(svP).concat(Object.keys(ivP))).forEach(fk => {
+        const s = svP[fk], i = ivP[fk];
+        const tb = tombs['dbs_paiements_2026 ' + fk] || 0;
+        if (s && !i) { if (!(tb && tb > (s._pts || 0))) R[fk] = s; return; }
+        if (i && !s) { if (!(tb && tb > (i._pts || 0))) R[fk] = i; return; }
+        if (!s || !i) return;
+        const sp = s._pts || 0, ip = i._pts || 0;
+        if (ip > sp) { R[fk] = i; return; }
+        if (sp > ip) { R[fk] = s; if (!ip) gardesP.push(fk); return; }
+        const par = {}; const ordreR = [];
+        (Array.isArray(s.reglements) ? s.reglements : []).forEach(r => { if (r && r.id != null && par[r.id] == null) { par[r.id] = r; ordreR.push(r.id); } });
+        (Array.isArray(i.reglements) ? i.reglements : []).forEach(r => {
+          if (!r || r.id == null) return;
+          if (par[r.id] == null) { par[r.id] = r; ordreR.push(r.id); }
+          else if ((r.ts || 0) > (par[r.id].ts || 0)) par[r.id] = r;
+        });
+        const regs = ordreR.filter(id => { const t2 = tombs['reglements ' + fk + '|' + id] || 0; return !(t2 && t2 > (par[id].ts || 0)); }).map(id => par[id]);
+        if ((s.reglements || []).length > (i.reglements || []).length && regs.length > (i.reglements || []).length) gardesP.push(fk);
+        R[fk] = Object.assign({}, s, i, { reglements: regs });
+      });
+      if (gardesP.length) {
+        console.warn('[GARDE PAIEMENTS] entrées protégées=' + gardesP.length + ' ' + gardesP.slice(0, 5).join(','));
+        try { logAudit('paiement_protege', { nombre: gardesP.length, factures: gardesP.slice(0, 20) }); } catch (e) {}
+        detail.push({ champ: 'dbs_paiements_2026', sauvees: gardesP.length, retirees: 0, exemples: gardesP.slice(0, 5).map(x => 'règlement conservé: ' + x) });
+      }
+      out['dbs_paiements_2026'] = JSON.stringify(R);
+    }
+  } catch (e) {}
+
+  /* 2b · tableaux de fiches de premier niveau (journal d'activité, comptes) */
+  ['dbs_activity_log', 'dbs_comptes_bancaires'].forEach(k => {
     try {
       const sv = JSON.parse(serverKeys[k] || 'null');
       const iv = JSON.parse(inKeys[k] || 'null');
@@ -507,9 +625,26 @@ function mergeAutorite(serverKeys, inKeys) {
       const sv = JSON.parse(serverKeys[k] || 'null');
       const iv = JSON.parse(inKeys[k] || 'null');
       if (sv && iv && typeof sv === 'object' && typeof iv === 'object' && !Array.isArray(sv) && !Array.isArray(iv)) {
-        const R = {};
-        Object.keys(sv).forEach(id => { if (!tombs['orders ' + id]) R[id] = sv[id]; });
-        Object.keys(iv).forEach(id => { R[id] = iv[id]; });
+        const R = {}; const gardesE = [];
+        Object.keys(sv).forEach(id => { if (!tombs['orders ' + id] && !tombs[k + ' ' + id]) R[id] = sv[id]; });
+        Object.keys(iv).forEach(id => {
+          /* ✨ v7.0 : entrée présente des deux côtés et horodatée côté serveur —
+             une photo PLUS VIEILLE (ou d'époque, sans _ts) ne l'écrase plus.
+             Toute modification réelle d'un poste est horodatée et gagne. */
+          const s = sv[id], i = iv[id];
+          if (s && i && typeof s === 'object' && typeof i === 'object' && !Array.isArray(s) && !Array.isArray(i)) {
+            if ((s._ts || 0) > (i._ts || 0)) { if (R[id] == null) R[id] = s; gardesE.push(id); return; }
+          }
+          const tb = tombs[k + ' ' + id] || 0;
+          const its = (i && typeof i === 'object' && i._ts) || 0;
+          if (tb && tb > its) return;                      /* supprimée plus récemment ailleurs */
+          R[id] = i;
+        });
+        if (gardesE.length) {
+          console.warn('[GARDE ' + k + '] entrées protégées=' + gardesE.length + ' ' + gardesE.slice(0, 5).join(','));
+          try { logAudit('entree_protegee', { cle: k, nombre: gardesE.length, ids: gardesE.slice(0, 20) }); } catch (e) {}
+          detail.push({ champ: k, sauvees: gardesE.length, retirees: 0, exemples: gardesE.slice(0, 3) });
+        }
         out[k] = JSON.stringify(R);
       }
     } catch (e) {}
@@ -526,7 +661,9 @@ function mergeAutorite(serverKeys, inKeys) {
       }); } catch (e) {}
     });
     all.sort((a, b) => (a.ts || 0) - (b.ts || 0));
-    out['dbs_tombstones'] = JSON.stringify(all.slice(-4000));
+    /* ✨ v7.0 : mémoire de suppression DURABLE côté serveur (20 000 entrées ≈
+       des années de suppressions) — les postes gardent leur propre taille. */
+    out['dbs_tombstones'] = JSON.stringify(all.slice(-20000));
   } catch (e) {}
 
   detail.forEach(d => { rescued += (d.sauvees || 0); });
