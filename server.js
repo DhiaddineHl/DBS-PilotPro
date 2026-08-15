@@ -305,6 +305,25 @@ function _fusionFiche(ancienne, recente) {
    (PostgreSQL ou fichier). Garantit que la vérité verbatim et les
    projections pp_* sont construites à partir des MÊMES données : aucune
    divergence possible entre les deux représentations. */
+/* ✨ v7.2 — DÉPOLLUTION des listes de phrases (champ « matières » des factures…).
+   La faille d'encodage (corrigée dans readBody) avait créé des milliers de
+   variantes de la même phrase, différant seulement par des caractères « � »
+   (« SAN°651660 » → « SAN��651660 » → …). L'union de fusion les gardait toutes :
+   16 Mo dans une entrée → stockage plein sur tous les postes. Ici : on regroupe
+   les variantes d'une même phrase (clé = texte sans caractères spéciaux) et on
+   garde la MOINS abîmée — la version propre gagne toujours. Déterministe et
+   idempotent ; appliqué au passage obligé, donc aussi aux restaurations. */
+function _depolluerListe(arr) {
+  if (!Array.isArray(arr) || arr.length < 2 || !arr.every(x => typeof x === 'string')) return arr;
+  const meilleur = {}; const abime = {}; const ordre = [];
+  arr.forEach(s => {
+    const cle = s.replace(/[^\x20-\x7E]/g, '').replace(/\s+/g, ' ').trim();
+    const n = (s.match(/\uFFFD/g) || []).length;
+    if (meilleur[cle] === undefined) { meilleur[cle] = s; abime[cle] = n; ordre.push(cle); }
+    else if (n < abime[cle]) { meilleur[cle] = s; abime[cle] = n; }
+  });
+  return ordre.map(c => meilleur[c]);
+}
 function normaliserEtat(keys) {
   const out = {}; const trace = [];
   Object.keys(keys || {}).forEach(k => {
@@ -320,6 +339,23 @@ function normaliserEtat(keys) {
     if (_estTableauFiches(obj)) obj = nettoyer(obj, '(racine)');
     else if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
       Object.keys(obj).forEach(ch => { if (_estTableauFiches(obj[ch])) obj[ch] = nettoyer(obj[ch], ch); });
+    }
+    if (k === 'dbs_overrides_2026' && obj && typeof obj === 'object' && !Array.isArray(obj)) {
+      Object.keys(obj).forEach(fk => {
+        const e = obj[fk];
+        if (!e || typeof e !== 'object' || Array.isArray(e)) return;
+        Object.keys(e).forEach(ch => {
+          const v = e[ch];
+          if (Array.isArray(v) && v.length > 1 && v.every(x => typeof x === 'string')) {
+            const net = _depolluerListe(v);
+            if (net.length !== v.length) {
+              touche = true;
+              trace.push({ cle: k, champ: fk + '.' + ch, avant: v.length, apres: net.length });
+              e[ch] = net;
+            }
+          }
+        });
+      });
     }
     out[k] = touche ? JSON.stringify(obj) : brut;      /* inchangé → octets d'origine préservés */
   });
@@ -597,6 +633,34 @@ function mergeAutorite(serverKeys, inKeys) {
     } catch (e) {}
   });
 
+  /* ✨ v7.1 · VERROU DE FRAÎCHEUR PAR BLOC — GPAO, Grand Livre, liste des
+     factures Excel supprimées, comptes bancaires : ces clés se remplacent EN
+     BLOC (pas de fusion fiche par fiche — un seul utilisateur par module).
+     Chaque poste pose un horodatage de bloc (dbs_bloc_ts) à chaque VRAIE
+     modification. Règle : un bloc PLUS ANCIEN que celui du serveur ne
+     l'écrase jamais — c'est l'incident du téléphone du 14/08 (vieille photo
+     mobile → Grand Livre régressé) rendu impossible. Sans horodatage des
+     deux côtés : comportement historique (le poste gagne) — le verrou
+     s'arme automatiquement au premier enregistrement d'un poste à jour. */
+  try {
+    const BLOCS = { gpao: 'dbs_gpao_prod_v2', gl: 'dbs_grandlivre_2026_v2', deleted: 'dbs_deleted_2026', comptes: 'dbs_comptes_bancaires' };
+    const sT = JSON.parse(serverKeys['dbs_bloc_ts'] || '{}') || {};
+    const iT = JSON.parse(inKeys['dbs_bloc_ts'] || '{}') || {};
+    const outT = {};
+    Object.keys(BLOCS).forEach(c => {
+      const k = BLOCS[c];
+      const st = +sT[c] || 0, it = +iT[c] || 0;
+      outT[c] = Math.max(st, it);
+      if (st > it && serverKeys[k] != null && inKeys[k] != null && inKeys[k] !== serverKeys[k]) {
+        out[k] = serverKeys[k];
+        console.warn('[GARDE BLOC] ' + k + ' : bloc du poste plus ancien (' + (it || 'sans horodatage') + ' < ' + st + ') → version serveur conservée');
+        try { logAudit('bloc_protege', { cle: k, horodatage_poste: it, horodatage_serveur: st }); } catch (e) {}
+        detail.push({ champ: k, sauvees: 1, retirees: 0, exemples: ['bloc plus ancien ignoré (verrou de fraîcheur)'] });
+      }
+    });
+    out['dbs_bloc_ts'] = JSON.stringify(outT);
+  } catch (e) {}
+
   /* index du magasin de fichiers : union par entrée, pierres tombales respectées,
      la plus récente gagne — une photo supprimée ne ressuscite pas, une photo
      ajoutée pendant une divergence n'est jamais perdue. */
@@ -716,9 +780,15 @@ function serveFile(res, file) {
   });
 }
 function readBody(req, cb) {
-  let data = '';
-  req.on('data', c => { data += c; if (data.length > 60 * 1024 * 1024) req.destroy(); });
-  req.on('end', () => cb(data));
+  /* ✨ v7.2 — LECTURE EN OCTETS. L'ancienne version collait les morceaux réseau
+     comme du TEXTE (data += chunk) : quand la coupure entre deux morceaux
+     tombait au milieu d'un caractère accentué (é, è, ° = 2 octets), les deux
+     moitiés devenaient « � ». C'était la source des libellés « FN��16 » et de
+     l'explosion des « matières » (16 Mo de variantes corrompues → stockage
+     plein sur les postes). On assemble les OCTETS, on décode l'UTF-8 UNE fois. */
+  const bufs = []; let len = 0;
+  req.on('data', c => { bufs.push(c); len += c.length; if (len > 60 * 1024 * 1024) req.destroy(); });
+  req.on('end', () => cb(Buffer.concat(bufs).toString('utf8')));
 }
 function json(res, code, obj) {
   const jsonStr = JSON.stringify(obj);
